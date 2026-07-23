@@ -18,6 +18,12 @@ DEFAULT_GRIEVANCE_TYPE = 'uncategorized'
 VALID_PERMISSION_TYPES = frozenset({'restricted_read', 'read', 'create', 'update', 'delete'})
 CATEGORY_SEPARATOR = ' > '
 
+VALID_ASSIGNMENT_STRATEGIES = frozenset({'random', 'round_robin', 'least_loaded'})
+VALID_ASSIGNMENT_SCOPES = frozenset({'district', 'national'})
+VALID_VIEW_SCOPE_DEFAULTS = frozenset({'all_cases', 'district_scoped', 'creator_scoped', 'none'})
+ALLOWED_WORKFLOW_APPROVED_SIGNALS = frozenset({'payments.arrears.create'})
+ALLOWED_WORKFLOW_RESOLVE_TASKS = frozenset({'tasks_management'})
+
 DEFAULT_CFG = {
     "default_validations_disabled": False,
     "default_grievance_type": DEFAULT_GRIEVANCE_TYPE,
@@ -41,6 +47,35 @@ DEFAULT_CFG = {
 
     "attending_staff_role_ids": [],
     "default_attending_staff_role_ids": {DEFAULT_STRING: [1, 2]},
+    "ticket_statuses": [
+        {"code": "OPEN", "label": "Open", "initial": True},
+        {"code": "IN_PROGRESS", "label": "In Progress"},
+        {"code": "RESOLVED", "label": "Resolved", "terminal": True},
+    ],
+    "referral_entities": ["Police", "Traditional Leader", "Court", "Ministry of Gender", "Other"],
+    "view_scope": {
+        "all_cases_roles": [],
+        "district_scoped_roles": [],
+        "creator_scoped_roles": [],
+        "default": "district_scoped",
+    },
+    "sla": {
+        "set_due_date_on_create": True,
+        "duration_basis": {"pending": "days_since_created", "resolved": "days_created_to_resolved"},
+        "row_colors": {"within_sla": "yellow", "breached": "red", "resolved": "white"},
+    },
+    "notifications": {"on_assign": True, "include_due_date": True, "channels": ["email"]},
+    "participant_fields": [],
+    "search_filters": ["formNumber", "location", "nationalId", "status", "priority", "dateRange"],
+    "search_result_columns": [
+        {"key": "formNumber", "label": "HH Form Number"},
+        {"key": "location", "label": "Location"},
+        {"key": "status", "label": "Status"},
+        {"key": "priority", "label": "Priority"},
+        {"key": "attendingStaff", "label": "Officer Assigned"},
+        {"key": "duration", "label": "Duration"},
+    ],
+    "enable_export": True,
 }
 
 
@@ -66,6 +101,16 @@ class TicketConfig(AppConfig):
     default_grievance_type = DEFAULT_GRIEVANCE_TYPE
     attending_staff_role_ids = []
     default_attending_staff_role_ids = {}
+
+    ticket_statuses = []
+    referral_entities = []
+    view_scope = {}
+    sla = {}
+    notifications = {}
+    participant_fields = []
+    search_filters = []
+    search_result_columns = []
+    enable_export = False
 
     # Processed structures for enhanced configurations
     processed_categories = {}
@@ -127,6 +172,11 @@ class TicketConfig(AppConfig):
         self.__validate_grievance_dict_fields(cfg, 'grievance_anonymized_fields')
         self.__validate_grievance_dict_fields(cfg, 'default_resolution')
         self.__validate_grievance_default_resolution_time(cfg)
+        self.__validate_ticket_statuses(cfg)
+        self.__validate_referral_entities(cfg)
+        self.__validate_attending_staff_roles(cfg)
+        self.__validate_view_scope(cfg)
+        self.__validate_category_workflows(cfg)
 
     def _merge_with_defaults(self, instance):
         return {**copy.deepcopy(DEFAULT_CFG), **instance._cfg}
@@ -252,6 +302,136 @@ class TicketConfig(AppConfig):
                     )
 
     @classmethod
+    def __validate_ticket_statuses(cls, cfg):
+        """
+        `ticket_statuses` only selects which model statuses are enabled and their
+        labels — the model's Ticket.TicketStatus stays the source of truth. Every
+        code must be a valid choice and exactly one status must be `initial`.
+        """
+        statuses = cfg.get('ticket_statuses', [])
+        if not statuses:
+            return
+
+        from .models import Ticket
+        valid_codes = set(Ticket.TicketStatus.values)
+
+        initial_count = 0
+        for status in statuses:
+            if not isinstance(status, dict) or not status.get('code'):
+                raise ValidationError("Each entry in 'ticket_statuses' must be a dict with a 'code'.")
+            code = status['code']
+            if code not in valid_codes:
+                raise ValidationError(
+                    f"ticket_statuses code '{code}' is not a valid Ticket.TicketStatus "
+                    f"(one of {sorted(valid_codes)}). Add it to the model first."
+                )
+            if status.get('initial'):
+                initial_count += 1
+
+        if initial_count != 1:
+            raise ValidationError(
+                f"'ticket_statuses' must define exactly one 'initial' status, found {initial_count}."
+            )
+
+    @classmethod
+    def __validate_referral_entities(cls, cfg):
+        """`referral_entities` must be non-empty when the REFERRED status is enabled."""
+        statuses = cfg.get('ticket_statuses', [])
+        referred_enabled = any(
+            isinstance(s, dict) and s.get('code') == 'REFERRED' for s in statuses
+        )
+        if referred_enabled and not cfg.get('referral_entities'):
+            raise ValidationError(
+                "'referral_entities' must be non-empty when the 'REFERRED' status is enabled."
+            )
+
+    @classmethod
+    def __validate_attending_staff_roles(cls, cfg):
+        """
+        `default_attending_staff_role_ids` maps category → roles. Each value is
+        either a plain list of role ids (legacy) or a dict adding strategy/scope.
+        """
+        mapping = cfg.get('default_attending_staff_role_ids', {})
+        if not isinstance(mapping, dict):
+            raise ValidationError("'default_attending_staff_role_ids' must be a dict of category → roles.")
+
+        for category, value in mapping.items():
+            if isinstance(value, list):
+                role_ids = value
+            elif isinstance(value, dict):
+                role_ids = value.get('role_ids', [])
+                if not isinstance(role_ids, list):
+                    raise ValidationError(
+                        f"default_attending_staff_role_ids['{category}'].role_ids must be a list."
+                    )
+                strategy = value.get('strategy')
+                if strategy is not None and strategy not in VALID_ASSIGNMENT_STRATEGIES:
+                    raise ValidationError(
+                        f"default_attending_staff_role_ids['{category}'].strategy '{strategy}' is "
+                        f"invalid. Allowed: {sorted(VALID_ASSIGNMENT_STRATEGIES)}."
+                    )
+                scope = value.get('scope')
+                if scope is not None and scope not in VALID_ASSIGNMENT_SCOPES:
+                    raise ValidationError(
+                        f"default_attending_staff_role_ids['{category}'].scope '{scope}' is "
+                        f"invalid. Allowed: {sorted(VALID_ASSIGNMENT_SCOPES)}."
+                    )
+            else:
+                raise ValidationError(
+                    f"default_attending_staff_role_ids['{category}'] must be a list of role ids "
+                    f"or a {{role_ids, strategy, scope}} dict."
+                )
+            if not all(isinstance(r, int) for r in role_ids):
+                raise ValidationError(
+                    f"default_attending_staff_role_ids['{category}'] role ids must be integers."
+                )
+
+    @classmethod
+    def __validate_view_scope(cls, cfg):
+        """`view_scope` role lists must be integer ids; `default` from the allowed set."""
+        view_scope = cfg.get('view_scope', {})
+        if not view_scope:
+            return
+        if not isinstance(view_scope, dict):
+            raise ValidationError("'view_scope' must be a dict.")
+
+        for key in ('all_cases_roles', 'district_scoped_roles', 'creator_scoped_roles'):
+            role_ids = view_scope.get(key, [])
+            if not isinstance(role_ids, list) or not all(isinstance(r, int) for r in role_ids):
+                raise ValidationError(f"view_scope['{key}'] must be a list of integer role ids.")
+
+        default = view_scope.get('default', 'district_scoped')
+        if default not in VALID_VIEW_SCOPE_DEFAULTS:
+            raise ValidationError(
+                f"view_scope['default'] '{default}' is invalid. "
+                f"Allowed: {sorted(VALID_VIEW_SCOPE_DEFAULTS)}."
+            )
+
+    @classmethod
+    def __validate_category_workflows(cls, cfg):
+        """Per-category `workflow` hand-off signals must be in the allow-lists."""
+        processed = cfg.get('processed_categories', {})
+        for name, info in processed.items():
+            workflow = info.get('workflow')
+            if not workflow:
+                continue
+            if not isinstance(workflow, dict):
+                raise ValidationError(f"Category '{name}' workflow must be a dict.")
+
+            approved_signal = workflow.get('on_approved_signal')
+            if approved_signal is not None and approved_signal not in ALLOWED_WORKFLOW_APPROVED_SIGNALS:
+                raise ValidationError(
+                    f"Category '{name}' workflow.on_approved_signal '{approved_signal}' is not "
+                    f"allowed. Allowed: {sorted(ALLOWED_WORKFLOW_APPROVED_SIGNALS)}."
+                )
+            resolve_task = workflow.get('on_resolve_task')
+            if resolve_task is not None and resolve_task not in ALLOWED_WORKFLOW_RESOLVE_TASKS:
+                raise ValidationError(
+                    f"Category '{name}' workflow.on_resolve_task '{resolve_task}' is not "
+                    f"allowed. Allowed: {sorted(ALLOWED_WORKFLOW_RESOLVE_TASKS)}."
+                )
+
+    @classmethod
     def __process_unified_categories(cls, cfg):
         """
         Process grievance_types configuration supporting both string and dict formats
@@ -296,6 +476,9 @@ class TicketConfig(AppConfig):
                     'default_flags': list(parent.get('default_flags', [])),
                     'resolution_times': parent.get('resolution_times'),
                     'visible_fields': list(parent.get('visible_fields', [])),
+                    # workflow is leaf-specific and defined only on dict items, so
+                    # string categories never carry one (no inheritance).
+                    'workflow': None,
                     'parent': parent_name,
                     'children': {},
                     'generated_rights': {}
@@ -363,6 +546,9 @@ class TicketConfig(AppConfig):
                     'default_flags': default_flags,
                     'resolution_times': resolution_times,
                     'visible_fields': visible_fields,
+                    # workflow hand-off (maker-checker / tasks_management); leaf-specific,
+                    # not inherited from the parent.
+                    'workflow': item.get('workflow'),
                     'parent': parent_name,
                     'children': {},
                     'generated_rights': {}  # Will be populated by rights generation
