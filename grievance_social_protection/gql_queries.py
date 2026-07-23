@@ -43,7 +43,7 @@ TICKET_FILTER_FIELDS = {
     'reporter_id': ["exact"],
     "due_date": ["exact", "istartswith", "icontains", "iexact"],
     "date_of_incident": ["exact", "istartswith", "icontains", "iexact"],
-    "date_created": ["exact", "istartswith", "icontains", "iexact"],
+    "date_created": ["exact", "istartswith", "icontains", "iexact", "gte", "lte"],
     **prefix_filterset("attending_staff__", UserGQLType._meta.filter_fields),
 }
 
