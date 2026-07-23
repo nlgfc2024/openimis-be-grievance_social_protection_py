@@ -15,6 +15,7 @@ from grievance_social_protection.tests.data import (
 from grievance_social_protection.apps import DEFAULT_CFG
 from grievance_social_protection.tests.test_helpers import (
     create_ticket,
+    create_test_individual,
     setup_grievance_config,
     restore_grievance_config,
 )
@@ -173,3 +174,65 @@ class TicketDueDateAndStatusTest(TestCase):
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertEqual(ticket.due_date, date.today())
         self.assertEqual(ticket.status, Ticket.TicketStatus.RESOLVED)
+
+
+class TicketReporterDenormalizationTest(TestCase):
+    """denormalise reporter jsonExt fields into ticket.json_ext at create."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+
+    def test_individual_reporter_fields_denormalized(self):
+        individual = create_test_individual(self.user, json_ext={
+            'form_number': 'FN-001',
+            'national_id': 'NID-123',
+            'location_code': 'LOC1',
+            'location_name': 'Test Village',
+            'traditional_authority_name': 'Test TA',
+            'group_village_head_name': 'Test GVH',
+            'unrelated_key': 'should not leak onto the ticket',
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "Reporter test",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('form_number'), 'FN-001')
+        self.assertEqual(ticket.json_ext.get('national_id'), 'NID-123')
+        self.assertEqual(ticket.json_ext.get('location_code'), 'LOC1')
+        self.assertEqual(ticket.json_ext.get('location_name'), 'Test Village')
+        self.assertEqual(ticket.json_ext.get('traditional_authority_name'), 'Test TA')
+        self.assertEqual(ticket.json_ext.get('group_village_head_name'), 'Test GVH')
+        self.assertNotIn('unrelated_key', ticket.json_ext)
+
+    def test_individual_reporter_missing_keys_skipped_without_error(self):
+        individual = create_test_individual(self.user, json_ext={'form_number': 'FN-002'})
+        result = self.service.create({
+            "category": "Default",
+            "title": "Partial reporter data",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('form_number'), 'FN-002')
+        self.assertNotIn('national_id', ticket.json_ext)
+
+    def test_ticket_without_reporter_creates_without_error(self):
+        result = self.service.create({
+            "category": "Default",
+            "title": "No reporter",
+            "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext or {}, {})

@@ -19,6 +19,18 @@ from grievance_social_protection.validations import (
 from grievance_social_protection.access_control import GrievanceAccessControl
 from grievance_social_protection.apps import TicketConfig
 
+# Reporter jsonExt keys (Individual `individual_schema`) denormalised onto
+# ticket.json_ext at create, so the Ticket Custom Filter Wizard can
+# filter on them without traversing the reporter's GenericForeignKey.
+DENORMALIZED_REPORTER_JSON_EXT_FIELDS = (
+    'form_number',
+    'national_id',
+    'location_code',
+    'location_name',
+    'traditional_authority_name',
+    'group_village_head_name',
+)
+
 
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
@@ -43,6 +55,7 @@ class TicketService(BaseService):
             raise ValidationError(resolution_error)
         self._apply_default_status(obj_data)
         self._apply_due_date(obj_data)
+        self._denormalize_reporter_fields(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -228,6 +241,49 @@ class TicketService(BaseService):
             # due_date is date-only; round a partial-day SLA up to the next day.
             due_date += timedelta(days=1)
         obj_data['due_date'] = due_date
+
+    def _denormalize_reporter_fields(self, obj_data):
+        """
+        Copy searchable participant fields from the reporter's jsonExt into
+        ticket.json_ext at create time. Django can't `.filter()` across the
+        reporter's GenericForeignKey, so the Ticket Custom Filter Wizard
+        filters the ticket's own json_ext instead.
+        Missing individual data or an unsupported reporter type (e.g. User) is
+        skipped silently; already-present json_ext keys are left untouched.
+        """
+        reporter_type = obj_data.get('reporter_type')
+        reporter_id = obj_data.get('reporter_id')
+        if not reporter_type or not reporter_id:
+            return
+
+        individual = self._resolve_reporter_individual(reporter_type, reporter_id)
+        if not individual:
+            return
+
+        source = individual.json_ext or {}
+        json_ext = dict(obj_data.get('json_ext') or {})
+        for field in DENORMALIZED_REPORTER_JSON_EXT_FIELDS:
+            value = source.get(field)
+            if value not in (None, ''):
+                json_ext[field] = value
+        if json_ext:
+            obj_data['json_ext'] = json_ext
+
+    @staticmethod
+    def _resolve_reporter_individual(reporter_type, reporter_id):
+        """
+        Return the Individual behind a reporter — directly, or via Beneficiary —
+        or None. Mirrors the reporter_type.name branching already used in
+        TicketGQLType.resolve_reporter_first_name/_last_name.
+        """
+        model_object = reporter_type.get_object_for_this_type(pk=reporter_id)
+        if not model_object:
+            return None
+        if reporter_type.name == 'individual':
+            return model_object
+        if reporter_type.name == 'beneficiary':
+            return model_object.individual
+        return None  # 'user' reporters have no household jsonExt to denormalize
 
 
 class CommentService:

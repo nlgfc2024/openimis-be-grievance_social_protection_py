@@ -1,5 +1,8 @@
 import copy
 
+from django.apps import apps
+
+from core.datetimes.ad_datetime import datetime
 from core.models import Role, RoleRight, UserRole
 from core.test_helpers import create_test_interactive_user, create_test_role
 from grievance_social_protection.apps import TicketConfig
@@ -29,6 +32,19 @@ def create_ticket(user):
     ticket = Ticket(**service_add_ticket_payload)
     ticket.save(user=user)
     return ticket
+
+
+def create_test_individual(user, json_ext=None):
+    """Create a minimal Individual for reporter-denormalization tests."""
+    individual_model = apps.get_model('individual', 'Individual')
+    individual = individual_model(
+        first_name='TestFN',
+        last_name='TestLN',
+        dob=datetime.now(),
+        json_ext=json_ext or {},
+    )
+    individual.save(username=user.username)
+    return individual
 
 
 def create_comment_for_existing_ticket(user, ticket, resolved=False):
