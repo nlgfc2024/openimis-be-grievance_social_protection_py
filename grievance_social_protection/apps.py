@@ -159,8 +159,21 @@ class TicketConfig(AppConfig):
             except (OperationalError, ProgrammingError):
                 logger.info("Database tables not ready, skipping automatic rights generation.")
 
+        self.__initialize_custom_filters()
+
         register_validator(MODULE_NAME, self._validate_module_config)
         register_reloader(MODULE_NAME, self._reload_module_config)
+
+    @classmethod
+    def __initialize_custom_filters(cls):
+        """Register the Ticket Custom Filter Wizard for advanced case search."""
+        from core.custom_filters import CustomFilterRegistryPoint
+        from .custom_filters import TicketCustomFilterWizard
+
+        CustomFilterRegistryPoint.register_custom_filters(
+            module_name=MODULE_NAME,
+            custom_filter_class_list=[TicketCustomFilterWizard],
+        )
 
     def __process_config(self, cfg):
         self.__process_unified_categories(cfg)
@@ -190,6 +203,7 @@ class TicketConfig(AppConfig):
         cfg = self._merge_with_defaults(instance)
         self.__process_config(cfg)
         self.__load_config(cfg)
+        self.__initialize_custom_filters()
 
     @classmethod
     def __validate_grievance_dict_fields(cls, cfg, field_name):

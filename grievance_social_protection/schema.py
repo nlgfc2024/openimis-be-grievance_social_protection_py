@@ -6,6 +6,7 @@ from core.schema import signal_mutation_module_validate
 from django.db.models import Q
 import graphene_django_optimizer as gql_optimizer
 
+from core.custom_filters import CustomFilterWizardStorage
 from core.utils import append_validity_filter
 from .apps import MODULE_NAME
 from .access_control import GrievanceAccessControl
@@ -31,6 +32,7 @@ class Query(graphene.ObjectType):
         show_history=graphene.Boolean(),
         client_mutation_id=graphene.String(),
         ticket_version=graphene.Int(),
+        customFilters=graphene.List(of_type=graphene.String),
     )
 
     ticketsStr = OrderedDjangoFilterConnectionField(
@@ -97,6 +99,12 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+
+        custom_filters = kwargs.get("customFilters")
+        if custom_filters:
+            query = CustomFilterWizardStorage.build_custom_filters_queryset(
+                MODULE_NAME, 'Ticket', custom_filters, query,
+            )
 
         return gql_optimizer.query(query, info)
 
