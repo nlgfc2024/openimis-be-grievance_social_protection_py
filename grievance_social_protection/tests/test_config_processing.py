@@ -1,10 +1,11 @@
+import copy
 import json
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
 from core.models import ModuleConfiguration
-from grievance_social_protection.apps import TicketConfig
+from grievance_social_protection.apps import TicketConfig, DEFAULT_CFG
 
 
 class ConfigProcessingTest(TestCase):
@@ -338,3 +339,105 @@ class ConfigProcessingTest(TestCase):
 
         self.assertFalse(form.is_valid())
         self.assertIn('urgent', str(form.errors))
+
+    # ── Extended config keys & validation ────────────────────────
+
+    def test_default_cfg_has_extended_config_keys(self):
+        """The new config blocks ship in DEFAULT_CFG."""
+        for key in ('ticket_statuses', 'referral_entities', 'view_scope', 'sla',
+                    'notifications', 'participant_fields', 'search_filters',
+                    'search_result_columns', 'enable_export'):
+            self.assertIn(key, DEFAULT_CFG)
+
+    def test_default_cfg_passes_validators(self):
+        """An empty override merges onto DEFAULT_CFG — it must validate cleanly."""
+        cfg = copy.deepcopy(DEFAULT_CFG)
+        TicketConfig._TicketConfig__validate_ticket_statuses(cfg)
+        TicketConfig._TicketConfig__validate_referral_entities(cfg)
+        TicketConfig._TicketConfig__validate_attending_staff_roles(cfg)
+        TicketConfig._TicketConfig__validate_view_scope(cfg)
+
+    def test_ticket_statuses_reject_unknown_code(self):
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_ticket_statuses(
+                {'ticket_statuses': [{'code': 'BOGUS', 'initial': True}]})
+
+    def test_ticket_statuses_require_single_initial(self):
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_ticket_statuses(
+                {'ticket_statuses': [{'code': 'OPEN', 'initial': True},
+                                     {'code': 'RESOLVED', 'initial': True}]})
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_ticket_statuses(
+                {'ticket_statuses': [{'code': 'OPEN'}, {'code': 'RESOLVED'}]})
+
+    def test_ticket_statuses_single_initial_ok(self):
+        TicketConfig._TicketConfig__validate_ticket_statuses(
+            {'ticket_statuses': [{'code': 'OPEN', 'initial': True},
+                                 {'code': 'RESOLVED', 'terminal': True}]})
+
+    def test_referral_entities_required_when_referred_enabled(self):
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_referral_entities(
+                {'ticket_statuses': [{'code': 'REFERRED'}], 'referral_entities': []})
+        TicketConfig._TicketConfig__validate_referral_entities(
+            {'ticket_statuses': [{'code': 'REFERRED'}], 'referral_entities': ['Police']})
+
+    def test_attending_staff_roles_accept_list_and_dict(self):
+        TicketConfig._TicketConfig__validate_attending_staff_roles(
+            {'default_attending_staff_role_ids': {'Default': [1, 2]}})
+        TicketConfig._TicketConfig__validate_attending_staff_roles(
+            {'default_attending_staff_role_ids':
+                {'Claims': {'role_ids': [5], 'strategy': 'random', 'scope': 'district'}}})
+
+    def test_attending_staff_roles_reject_invalid(self):
+        for value in ({'Claims': {'role_ids': [5], 'strategy': 'nope'}},
+                      {'Claims': {'role_ids': [5], 'scope': 'planet'}},
+                      {'Claims': ['five']}):
+            with self.assertRaises(ValidationError):
+                TicketConfig._TicketConfig__validate_attending_staff_roles(
+                    {'default_attending_staff_role_ids': value})
+
+    def test_view_scope_ok(self):
+        TicketConfig._TicketConfig__validate_view_scope(
+            {'view_scope': {'all_cases_roles': [1], 'district_scoped_roles': [2],
+                            'creator_scoped_roles': [3], 'default': 'district_scoped'}})
+
+    def test_view_scope_reject_invalid(self):
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_view_scope({'view_scope': {'default': 'whoever'}})
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_view_scope({'view_scope': {'all_cases_roles': ['x']}})
+
+    def _process_workflow_cfg(self, workflow):
+        cfg = {'grievance_types': [{'name': 'Claims', 'children': [
+            {'name': 'Partial wages', 'workflow': workflow}]}]}
+        TicketConfig._TicketConfig__process_unified_categories(cfg)
+        return cfg
+
+    def test_category_workflow_allows_known_signals(self):
+        TicketConfig._TicketConfig__validate_category_workflows(
+            self._process_workflow_cfg(
+                {'maker_checker': True, 'on_approved_signal': 'payments.arrears.create'}))
+        TicketConfig._TicketConfig__validate_category_workflows(
+            self._process_workflow_cfg({'on_resolve_task': 'tasks_management'}))
+
+    def test_category_workflow_rejects_unknown_signals(self):
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_category_workflows(
+                self._process_workflow_cfg({'on_approved_signal': 'totally.made.up'}))
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_category_workflows(
+                self._process_workflow_cfg({'on_resolve_task': 'nope'}))
+
+    def test_category_workflow_passthrough_dict_only(self):
+        """Dict children carry their workflow; string children never do."""
+        cfg = {'grievance_types': [{'name': 'Claims', 'children': [
+            'Unpaid wages',
+            {'name': 'Partial wages', 'workflow': {'on_resolve_task': 'tasks_management'}}]}]}
+        TicketConfig._TicketConfig__process_unified_categories(cfg)
+        processed = cfg['processed_categories']
+        partial = next(v for k, v in processed.items() if k.endswith('Partial wages'))
+        unpaid = next(v for k, v in processed.items() if k.endswith('Unpaid wages'))
+        self.assertEqual(partial['workflow'], {'on_resolve_task': 'tasks_management'})
+        self.assertIsNone(unpaid['workflow'])
