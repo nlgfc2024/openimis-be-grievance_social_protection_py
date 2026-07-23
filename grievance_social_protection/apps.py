@@ -50,6 +50,7 @@ DEFAULT_CFG = {
     "ticket_statuses": [
         {"code": "OPEN", "label": "Open", "initial": True},
         {"code": "IN_PROGRESS", "label": "In Progress"},
+        {"code": "REFERRED", "label": "Referred", "requires_referral_entity": True},
         {"code": "RESOLVED", "label": "Resolved", "terminal": True},
     ],
     "referral_entities": ["Police", "Traditional Leader", "Court", "Ministry of Gender", "Other"],

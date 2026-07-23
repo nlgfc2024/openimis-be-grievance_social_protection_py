@@ -7,6 +7,7 @@ from django.contrib.contenttypes.models import ContentType
 
 from core.models import User
 from core.validation import BaseModelValidation, ObjectExistsValidationMixin
+from grievance_social_protection.apps import TicketConfig
 from grievance_social_protection.models import Ticket, Comment
 
 
@@ -127,6 +128,37 @@ def validate_wage_amount(data):
 
     if value < 0:
         return {"message": _("validations.TicketValidation.validate_wage_amount.negative_value")}
+
+    return None
+
+
+def validate_status_transition(new_status, referred_to):
+    """
+    Validates:
+    - `new_status`, if provided, is one of the deployment's *enabled*
+      ticket_statuses (TicketConfig.ticket_statuses) — not just any valid
+      Ticket.TicketStatus model choice. An empty enabled-list (misconfigured
+      or not yet loaded) skips this check rather than blocking everything.
+    - moving to REFERRED requires `referred_to` to be one of the configured
+      `referral_entities`.
+    """
+    if not new_status:
+        return None
+
+    enabled_codes = {
+        status['code'] for status in TicketConfig.ticket_statuses or []
+        if isinstance(status, dict) and status.get('code')
+    }
+    if enabled_codes and new_status not in enabled_codes:
+        return {
+            "message": _("validations.TicketValidation.validate_status_transition.status_not_enabled")
+            % {"status": new_status}
+        }
+
+    if new_status == Ticket.TicketStatus.REFERRED:
+        referral_entities = TicketConfig.referral_entities or []
+        if not referred_to or referred_to not in referral_entities:
+            return {"message": _("validations.TicketValidation.validate_status_transition.referred_to_required")}
 
     return None
 

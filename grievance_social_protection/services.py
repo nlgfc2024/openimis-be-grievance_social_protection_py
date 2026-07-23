@@ -18,6 +18,7 @@ from grievance_social_protection.validations import (
     CommentValidation,
     validate_resolution,
     validate_wage_amount,
+    validate_status_transition,
     parse_resolution_time
 )
 from grievance_social_protection.access_control import GrievanceAccessControl
@@ -260,6 +261,7 @@ class TicketService(BaseService):
         self._apply_derived_micro_catchment(obj_data)
         self._apply_derived_project_fields(obj_data)
         self._apply_auto_assignment(obj_data)
+        self._apply_status_transition(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -276,6 +278,7 @@ class TicketService(BaseService):
         wage_amount_error = validate_wage_amount(obj_data)
         if wage_amount_error:
             raise ValidationError(wage_amount_error)
+        self._apply_status_transition(obj_data, existing_ticket=self._get_existing_ticket(obj_data))
         return super().update(obj_data)
 
     @register_service_signal('ticket_service.delete')
@@ -292,15 +295,15 @@ class TicketService(BaseService):
         except PermissionDenied as e:
             raise ValidationError(str(e))
 
-    def _validate_existing_ticket_access(self, obj_data, access_type):
-        """Validate user has permission for the existing ticket's category and flags"""
+    def _get_existing_ticket(self, obj_data):
+        """Look up the ticket being updated/deleted by uuid or id, or None if not given/found."""
         ticket_uuid = obj_data.get('uuid')
         ticket_id = obj_data.get('id')
         if not ticket_uuid and not ticket_id:
-            return
+            return None
 
-        ticket = None
         base_qs = Ticket.filter_queryset()
+        ticket = None
         if ticket_uuid:
             ticket = base_qs.filter(uuid=ticket_uuid).first()
         if not ticket and ticket_id:
@@ -308,6 +311,14 @@ class TicketService(BaseService):
                 ticket = base_qs.filter(id=ticket_id).first()
             else:
                 ticket = base_qs.filter(uuid=ticket_id).first()
+        return ticket
+
+    def _validate_existing_ticket_access(self, obj_data, access_type):
+        """Validate user has permission for the existing ticket's category and flags"""
+        if not obj_data.get('uuid') and not obj_data.get('id'):
+            return
+
+        ticket = self._get_existing_ticket(obj_data)
         if not ticket:
             raise ValidationError("Ticket does not exist.")
 
@@ -567,6 +578,52 @@ class TicketService(BaseService):
         assignee = AssignmentService.get_assignee(category, district_code)
         if assignee:
             obj_data['attending_staff'] = assignee
+
+    def _apply_status_transition(self, obj_data, existing_ticket=None):
+        """
+        Validate + apply status-transition side effects:
+        - the new status must be one of the deployment's enabled
+          ticket_statuses;
+        - REFERRED requires a valid `referred_to` (popped out of obj_data
+          since it isn't a model field — stored in json_ext instead);
+        - `was_referred` stays sticky once set, even through a later
+          RESOLVED, so the referral authority is never lost;
+        - `resolved_date` is set the first time a ticket reaches a terminal
+          status (per config `ticket_statuses[].terminal`).
+        Runs on both create and update; on create `existing_ticket` is None
+        so there's nothing to preserve from a prior state.
+        """
+        if 'status' not in obj_data and 'referred_to' not in obj_data:
+            return
+
+        new_status = obj_data.get('status') or (existing_ticket.status if existing_ticket else None)
+        referred_to = obj_data.pop('referred_to', None)
+
+        transition_error = validate_status_transition(new_status, referred_to)
+        if transition_error:
+            raise ValidationError(transition_error)
+
+        existing_json_ext = (existing_ticket.json_ext if existing_ticket else None) or {}
+        json_ext = dict(obj_data.get('json_ext') or existing_json_ext)
+
+        if new_status == Ticket.TicketStatus.REFERRED:
+            json_ext['was_referred'] = True
+            if referred_to:
+                json_ext['referred_to'] = referred_to
+        elif existing_json_ext.get('was_referred'):
+            json_ext['was_referred'] = True
+            if 'referred_to' not in json_ext and existing_json_ext.get('referred_to'):
+                json_ext['referred_to'] = existing_json_ext['referred_to']
+
+        terminal_codes = {
+            status['code'] for status in TicketConfig.ticket_statuses or []
+            if isinstance(status, dict) and status.get('terminal')
+        }
+        if new_status in terminal_codes and not existing_json_ext.get('resolved_date'):
+            json_ext['resolved_date'] = date.today().isoformat()
+
+        if json_ext:
+            obj_data['json_ext'] = json_ext
 
 
 class CommentService:

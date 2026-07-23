@@ -656,3 +656,88 @@ class TicketAutoAssignmentTest(TestCase):
         candidate_ids = {u.id for u in candidates}
         self.assertIn(self.dpm_user_1.id, candidate_ids)
         self.assertNotIn(self.dpm_user_2.id, candidate_ids)
+
+
+class TicketStatusTransitionTest(TestCase):
+    """Status-transition validation, sticky referral, and resolved_date."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+
+    def _create_ticket(self, **overrides):
+        payload = {"category": "Default", "title": "Status transition test", "channel": "Channel A"}
+        payload.update(overrides)
+        result = self.service.create(payload)
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        return Ticket.objects.get(uuid=result['data']['uuid'])
+
+    def test_referred_without_referred_to_rejected(self):
+        ticket = self._create_ticket()
+        with self.assertRaises(ValidationError) as context:
+            self.service.update({"id": ticket.uuid, "status": Ticket.TicketStatus.REFERRED})
+        self.assertIn(
+            _('validations.TicketValidation.validate_status_transition.referred_to_required'),
+            str(context.exception),
+        )
+
+    def test_referred_with_invalid_authority_rejected(self):
+        ticket = self._create_ticket()
+        with self.assertRaises(ValidationError) as context:
+            self.service.update({
+                "id": ticket.uuid, "status": Ticket.TicketStatus.REFERRED,
+                "referred_to": "Not A Real Authority",
+            })
+        self.assertIn(
+            _('validations.TicketValidation.validate_status_transition.referred_to_required'),
+            str(context.exception),
+        )
+
+    def test_referred_then_resolved_keeps_authority_and_sticky_flag(self):
+        ticket = self._create_ticket()
+        result = self.service.update({
+            "id": ticket.uuid, "status": Ticket.TicketStatus.REFERRED, "referred_to": "Police",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        referred_ticket = Ticket.objects.get(id=ticket.id)
+        self.assertEqual(referred_ticket.json_ext.get('referred_to'), 'Police')
+        self.assertTrue(referred_ticket.json_ext.get('was_referred'))
+        self.assertIsNone(referred_ticket.json_ext.get('resolved_date'))
+
+        result = self.service.update({"id": referred_ticket.uuid, "status": Ticket.TicketStatus.RESOLVED})
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        resolved_ticket = Ticket.objects.get(id=ticket.id)
+        self.assertEqual(resolved_ticket.status, Ticket.TicketStatus.RESOLVED)
+        self.assertTrue(resolved_ticket.json_ext.get('was_referred'))
+        self.assertEqual(resolved_ticket.json_ext.get('referred_to'), 'Police')
+        self.assertEqual(resolved_ticket.json_ext.get('resolved_date'), date.today().isoformat())
+
+    def test_resolved_without_referral_sets_resolved_date_only(self):
+        ticket = self._create_ticket()
+        result = self.service.update({"id": ticket.uuid, "status": Ticket.TicketStatus.RESOLVED})
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        resolved_ticket = Ticket.objects.get(id=ticket.id)
+        self.assertEqual(resolved_ticket.json_ext.get('resolved_date'), date.today().isoformat())
+        self.assertNotIn('was_referred', resolved_ticket.json_ext or {})
+
+    def test_status_not_in_enabled_list_rejected(self):
+        original_statuses = TicketConfig.ticket_statuses
+        TicketConfig.ticket_statuses = [
+            {'code': 'OPEN', 'label': 'Open', 'initial': True},
+            {'code': 'RESOLVED', 'label': 'Resolved', 'terminal': True},
+        ]
+        try:
+            ticket = self._create_ticket()
+            with self.assertRaises(ValidationError) as context:
+                self.service.update({
+                    "id": ticket.uuid, "status": Ticket.TicketStatus.REFERRED, "referred_to": "Police",
+                })
+            self.assertIn(
+                _('validations.TicketValidation.validate_status_transition.status_not_enabled'),
+                str(context.exception),
+            )
+        finally:
+            TicketConfig.ticket_statuses = original_statuses
