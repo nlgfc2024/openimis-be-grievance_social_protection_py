@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
@@ -14,6 +16,7 @@ from grievance_social_protection.apps import DEFAULT_CFG
 from grievance_social_protection.tests.test_helpers import (
     create_ticket,
     setup_grievance_config,
+    restore_grievance_config,
 )
 from core.test_helpers import LogInHelper
 from django.utils.translation import gettext as _
@@ -112,3 +115,61 @@ class TicketServiceTest(TestCase):
 
         exception = context.exception
         self.assertIn(_('validations.TicketValidation.validate_resolution.invalid_hour_value'), str(exception))
+
+
+class TicketDueDateAndStatusTest(TestCase):
+    """auto-computed due_date and default OPEN status on ticket creation."""
+
+    _config_snapshot = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls._config_snapshot = setup_grievance_config({
+            'grievance_types': [
+                {'name': 'Claims', 'resolution_times': '30,0'},
+                'no_sla_category',
+            ],
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_grievance_config(cls._config_snapshot)
+        super().tearDownClass()
+
+    def test_due_date_and_status_defaulted_on_create(self):
+        result = self.service.create({
+            "category": "Claims",
+            "title": "Unpaid wages",
+            "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.due_date, date.today() + timedelta(days=30))
+        self.assertEqual(ticket.status, Ticket.TicketStatus.OPEN)
+
+    def test_category_without_sla_gets_no_due_date(self):
+        result = self.service.create({
+            "category": "no_sla_category",
+            "title": "General query",
+            "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertIsNone(ticket.due_date)
+        self.assertEqual(ticket.status, Ticket.TicketStatus.OPEN)
+
+    def test_explicit_status_and_due_date_are_not_overridden(self):
+        result = self.service.create({
+            "category": "Claims",
+            "title": "Already resolved",
+            "channel": "Channel A",
+            "status": Ticket.TicketStatus.RESOLVED,
+            "due_date": date.today(),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.due_date, date.today())
+        self.assertEqual(ticket.status, Ticket.TicketStatus.RESOLVED)

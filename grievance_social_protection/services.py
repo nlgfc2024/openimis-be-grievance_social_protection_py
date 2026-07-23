@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied
 from django.db.models import Max
@@ -11,7 +13,8 @@ from grievance_social_protection.models import Ticket, Comment
 from grievance_social_protection.validations import (
     TicketValidation,
     CommentValidation,
-    validate_resolution
+    validate_resolution,
+    parse_resolution_time
 )
 from grievance_social_protection.access_control import GrievanceAccessControl
 from grievance_social_protection.apps import TicketConfig
@@ -38,6 +41,8 @@ class TicketService(BaseService):
         resolution_error = validate_resolution(obj_data)
         if resolution_error:
             raise ValidationError(resolution_error)
+        self._apply_default_status(obj_data)
+        self._apply_due_date(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -176,6 +181,53 @@ class TicketService(BaseService):
             obj_data['priority'] = GrievanceAccessControl.get_effective_priority(
                 category, obj_data.get('flags')
             )
+
+    def _apply_default_status(self, obj_data):
+        """Default new tickets to the configured initial status (OPEN) when unset."""
+        if obj_data.get('status'):
+            return
+        obj_data['status'] = self._get_initial_status()
+
+    @staticmethod
+    def _get_initial_status():
+        for status in TicketConfig.ticket_statuses or []:
+            if isinstance(status, dict) and status.get('initial') and status.get('code'):
+                return status['code']
+        # Sane fallback if ticket_statuses is misconfigured/empty at runtime
+        return Ticket.TicketStatus.OPEN
+
+    def _apply_due_date(self, obj_data):
+        """
+        Auto-compute due_date on create from the category's configured SLA
+        (resolution_times), falling back to the ticket's own `resolution` value
+        when the category has none configured. Categories without any SLA are
+        left without a due_date — no error.
+        """
+        if obj_data.get('due_date'):
+            return
+        if not (TicketConfig.sla or {}).get('set_due_date_on_create', True):
+            return
+
+        category = obj_data.get('category')
+        # processed_categories carries the current resolution_times directly (set
+        # during category processing); unified_resolution_times additionally folds
+        # in the legacy default_resolution mapping for plain-string categories.
+        resolution_time = (TicketConfig.processed_categories or {}).get(category, {}).get('resolution_times')
+        if not resolution_time:
+            resolution_time = (TicketConfig.unified_resolution_times or {}).get(category)
+        if not resolution_time:
+            resolution_time = obj_data.get('resolution')
+
+        parsed = parse_resolution_time(resolution_time)
+        if not parsed:
+            return
+
+        days, hours = parsed
+        due_date = date.today() + timedelta(days=days)
+        if hours:
+            # due_date is date-only; round a partial-day SLA up to the next day.
+            due_date += timedelta(days=1)
+        obj_data['due_date'] = due_date
 
 
 class CommentService:

@@ -65,6 +65,27 @@ def validate_ticket_exists(data):
     return []
 
 
+RESOLUTION_TIME_PATTERN = re.compile(r"^(?P<days>[0-9]{1,2}),(?P<hours>[0-9]{1,2})$")
+
+
+def parse_resolution_time(value):
+    """
+    Parse a '{days},{hours}' SLA string (as used by resolution_times / resolution)
+    into (days, hours) ints. Returns None if `value` is falsy or out of range,
+    rather than raising — callers use this to opt out of an SLA silently.
+    """
+    if not value:
+        return None
+    match = RESOLUTION_TIME_PATTERN.match(value)
+    if not match:
+        return None
+    days = int(match.group("days"))
+    hours = int(match.group("hours"))
+    if not (0 <= days < 99 and 0 <= hours < 24):
+        return None
+    return days, hours
+
+
 def validate_resolution(data):
     """
     Validates that `value` is in the format '{days},{hours}'
