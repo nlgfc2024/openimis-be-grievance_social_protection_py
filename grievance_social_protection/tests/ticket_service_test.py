@@ -4,6 +4,8 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
+from location.models import Location
+
 from grievance_social_protection.models import Ticket
 from grievance_social_protection.services import TicketService
 from grievance_social_protection.tests.data import (
@@ -295,3 +297,77 @@ class TicketWageAmountTest(TestCase):
             _('validations.TicketValidation.validate_wage_amount.invalid_format'),
             str(context.exception),
         )
+
+
+class TicketDerivedDistrictTest(TestCase):
+    """Derive district_code (Region ancestor) from the participant's location.
+
+    Deployment level mapping: R/Region = District, D/District = Traditional
+    Authority, W/Municipality = Group Village Head, V/Village = Village.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+
+    def setUp(self):
+        self.region = Location.objects.create(code='BE05-R', name='Test Region', type='R')
+        self.district = Location.objects.create(
+            code='BE05-D', name='Test TA', type='D', parent=self.region)
+        self.municipality = Location.objects.create(
+            code='BE05-W', name='Test GVH', type='W', parent=self.district)
+        self.village = Location.objects.create(
+            code='BE05-V', name='Test Village', type='V', parent=self.municipality)
+
+    def tearDown(self):
+        Location.objects.filter(code__startswith='BE05-').delete()
+
+    def test_district_derived_from_village_location(self):
+        individual = create_test_individual(self.user, json_ext={
+            'location_code': self.village.code,
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "District derivation",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('district_code'), self.region.code)
+        self.assertEqual(ticket.json_ext.get('district_name'), self.region.name)
+
+    def test_missing_location_code_no_error(self):
+        individual = create_test_individual(self.user, json_ext={'form_number': 'FN-DIST-1'})
+        result = self.service.create({
+            "category": "Default",
+            "title": "No location code",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertNotIn('district_code', ticket.json_ext)
+
+    def test_partial_hierarchy_no_district_found(self):
+        """A location with no ancestor of type R must not error, just skip district."""
+        orphan_village = Location.objects.create(code='BE05-ORPHAN', name='Orphan Village', type='V')
+        individual = create_test_individual(self.user, json_ext={
+            'location_code': orphan_village.code,
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "Orphan location",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertNotIn('district_code', ticket.json_ext)
+        orphan_village.delete()

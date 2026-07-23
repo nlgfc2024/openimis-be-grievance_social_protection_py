@@ -1,5 +1,6 @@
 from datetime import date, timedelta
 
+from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied
 from django.db.models import Max
@@ -32,6 +33,35 @@ DENORMALIZED_REPORTER_JSON_EXT_FIELDS = (
     'group_village_head_name',
 )
 
+# Safety cap on hierarchy walk depth, guarding against a parent cycle in
+# location data. Today's 4 levels (R/D/W/V) need at most 3 hops (V->W->D->R);
+# one hop of margin covers a future 5th level without needing this touched.
+MAX_LOCATION_ANCESTOR_DEPTH = 4
+
+
+def _resolve_district_ancestor(location_code):
+    """
+    Walk the location hierarchy up from `location_code` to the Region (R)
+    ancestor. Returns (code, name), or (None, None) if the location isn't found or 
+    has no R ancestor.
+    """
+    if not location_code:
+        return None, None
+
+    location_model = apps.get_model('location', 'Location')
+    location = location_model.objects.select_related(
+        'parent', 'parent__parent', 'parent__parent__parent'
+    ).filter(code=location_code).first()
+
+    depth = 0
+    while location and location.type != 'R' and depth < MAX_LOCATION_ANCESTOR_DEPTH:
+        location = location.parent
+        depth += 1
+
+    if location and location.type == 'R':
+        return location.code, location.name
+    return None, None
+
 
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
@@ -60,6 +90,7 @@ class TicketService(BaseService):
         self._apply_default_status(obj_data)
         self._apply_due_date(obj_data)
         self._denormalize_reporter_fields(obj_data)
+        self._apply_derived_district(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -291,6 +322,24 @@ class TicketService(BaseService):
         if reporter_type.name == 'beneficiary':
             return model_object.individual
         return None  # 'user' reporters have no household jsonExt to denormalize
+
+    def _apply_derived_district(self, obj_data):
+        """
+        Derive district_code/district_name from the location_code
+        already denormalised onto ticket.json_ext by _denormalize_reporter_fields,
+        walking up to the Region (R) ancestor. No location_code, or no R
+        ancestor found, leaves the ticket without a district — no error.
+        """
+        json_ext = obj_data.get('json_ext') or {}
+        location_code = json_ext.get('location_code')
+        if not location_code:
+            return
+
+        district_code, district_name = _resolve_district_ancestor(location_code)
+        if district_code:
+            json_ext['district_code'] = district_code
+            json_ext['district_name'] = district_name
+            obj_data['json_ext'] = json_ext
 
 
 class CommentService:
