@@ -6,4 +6,5 @@ from .ticket_service_test import (  # noqa: F401
     TicketDerivedDistrictTest,
     TicketDerivedMicroCatchmentTest,
     TicketDerivedProjectFieldsTest,
+    TicketAutoAssignmentTest,
 )

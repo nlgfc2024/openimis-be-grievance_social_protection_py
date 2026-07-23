@@ -4,14 +4,14 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
-from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA
+from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA, UserDistrict
 from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
 from project_social_protection.models import (
     Activity, Project, BeneficiaryProjectEnrollment, BeneficiaryProjectTimeEntry,
 )
 
 from grievance_social_protection.models import Ticket
-from grievance_social_protection.services import TicketService
+from grievance_social_protection.services import TicketService, AssignmentService
 from grievance_social_protection.tests.data import (
     service_add_ticket_payload,
     service_add_ticket_payload_bad_resolution,
@@ -26,8 +26,9 @@ from grievance_social_protection.tests.test_helpers import (
     setup_grievance_config,
     restore_grievance_config,
 )
-from core.test_helpers import LogInHelper
+from core.test_helpers import LogInHelper, create_test_interactive_user, create_test_role
 from core.utils import TimeUtils
+from grievance_social_protection.apps import TicketConfig
 from django.utils.translation import gettext as _
 
 
@@ -568,3 +569,90 @@ class TicketDerivedProjectFieldsTest(TestCase):
         self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertEqual(ticket.json_ext.get('days_worked'), 0)
+
+
+class TicketAutoAssignmentTest(TestCase):
+    """Auto-assign attending_staff from default_attending_staff_role_ids config."""
+
+    _config_snapshot = None
+    _original_role_ids_cfg = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # default_attending_staff_role_ids isn't part of setup_grievance_config's
+        # snapshot/restore set, so save/restore it ourselves.
+        cls._original_role_ids_cfg = TicketConfig.default_attending_staff_role_ids
+
+        cls.dpm_role = create_test_role(name='BE10DPMRole')
+        cls.dpm_user_1 = create_test_interactive_user(username='be10_dpm1', roles=[cls.dpm_role.id])
+        cls.dpm_user_2 = create_test_interactive_user(username='be10_dpm2', roles=[cls.dpm_role.id])
+
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls._config_snapshot = setup_grievance_config({
+            'grievance_types': ['Claims', 'no_assignment_category'],
+            'default_attending_staff_role_ids': {
+                'Claims': {'role_ids': [cls.dpm_role.id], 'strategy': 'random'},
+            },
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_grievance_config(cls._config_snapshot)
+        TicketConfig.default_attending_staff_role_ids = cls._original_role_ids_cfg
+        super().tearDownClass()
+
+    def test_auto_assigns_to_role_holder(self):
+        result = self.service.create({
+            "category": "Claims", "title": "Unpaid wages", "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertIn(ticket.attending_staff_id, [self.dpm_user_1.id, self.dpm_user_2.id])
+
+    def test_no_config_leaves_unassigned(self):
+        result = self.service.create({
+            "category": "no_assignment_category", "title": "No assignment config", "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertIsNone(ticket.attending_staff)
+
+    def test_explicit_attending_staff_not_overridden(self):
+        result = self.service.create({
+            "category": "Claims", "title": "Manually assigned", "channel": "Channel A",
+            "attending_staff_id": self.dpm_user_1.id,
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.attending_staff_id, self.dpm_user_1.id)
+
+    def test_round_robin_cycles_through_candidates(self):
+        ordered = sorted([self.dpm_user_1, self.dpm_user_2], key=lambda u: u.id)
+        category = 'Claims'
+        baseline = Ticket.objects.filter(category=category).count()
+        # Candidate chosen must match ordered[count % 2] at each step.
+        first = AssignmentService.get_assignee(category, None)
+        self.assertEqual(first.id, ordered[baseline % 2].id)
+
+        Ticket(code=f'RR-{baseline}', category=category, attending_staff=first).save(user=self.user)
+        second = AssignmentService._pick(ordered, AssignmentService.STRATEGY_ROUND_ROBIN, category)
+        self.assertEqual(second.id, ordered[(baseline + 1) % 2].id)
+
+    def test_least_loaded_prefers_user_with_fewer_open_tickets(self):
+        Ticket(code='LL-BUSY', category='Claims', status=Ticket.TicketStatus.OPEN,
+               attending_staff=self.dpm_user_1).save(user=self.user)
+        chosen = AssignmentService._pick(
+            [self.dpm_user_1, self.dpm_user_2], AssignmentService.STRATEGY_LEAST_LOADED, 'Claims')
+        self.assertEqual(chosen.id, self.dpm_user_2.id)
+
+    def test_district_scope_filters_to_matching_user_district(self):
+        location = Location.objects.create(code='BE10-R', name='BE10 District', type='R')
+        UserDistrict(user=self.dpm_user_1.i_user, location=location, audit_user_id=-1).save()
+
+        candidates = AssignmentService._eligible_users(
+            [self.dpm_role.id], scope='district', district_code=location.code)
+        candidate_ids = {u.id for u in candidates}
+        self.assertIn(self.dpm_user_1.id, candidate_ids)
+        self.assertNotIn(self.dpm_user_2.id, candidate_ids)

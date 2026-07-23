@@ -1,3 +1,5 @@
+import logging
+import random
 from datetime import date, timedelta
 
 from django.apps import apps
@@ -20,6 +22,8 @@ from grievance_social_protection.validations import (
 )
 from grievance_social_protection.access_control import GrievanceAccessControl
 from grievance_social_protection.apps import TicketConfig
+
+logger = logging.getLogger(__name__)
 
 # Reporter jsonExt keys (Individual `individual_schema`) denormalised onto
 # ticket.json_ext at create, so the Ticket Custom Filter Wizard can
@@ -139,6 +143,92 @@ def _resolve_days_worked(reporter_type, reporter_id):
     ).count()
 
 
+class AssignmentService:
+    """
+    Auto-assignment: picks an attending-staff user for a newly
+    created ticket from its category's `default_attending_staff_role_ids`
+    config (a role-id list, or a `{role_ids, strategy, scope}` dict).
+    No config, no role holder, or (when scope=district) no holder in the
+    ticket's district leaves the ticket unassigned — logged, not an error.
+    """
+
+    STRATEGY_RANDOM = 'random'
+    STRATEGY_ROUND_ROBIN = 'round_robin'
+    STRATEGY_LEAST_LOADED = 'least_loaded'
+
+    _TERMINAL_STATUSES = {Ticket.TicketStatus.RESOLVED, Ticket.TicketStatus.CLOSED}
+
+    @classmethod
+    def get_assignee(cls, category, district_code=None):
+        config = (TicketConfig.default_attending_staff_role_ids or {}).get(category)
+        if not config:
+            return None
+
+        role_ids, strategy, scope = cls._parse_config(config)
+        if not role_ids:
+            return None
+
+        candidates = cls._eligible_users(role_ids, scope, district_code)
+        if not candidates:
+            logger.info(
+                "No eligible attending-staff user for category '%s' (role_ids=%s, "
+                "scope=%s, district_code=%s); leaving ticket unassigned.",
+                category, role_ids, scope, district_code,
+            )
+            return None
+
+        return cls._pick(candidates, strategy, category)
+
+    @staticmethod
+    def _parse_config(config):
+        if isinstance(config, dict):
+            return (
+                list(config.get('role_ids') or []),
+                config.get('strategy') or AssignmentService.STRATEGY_RANDOM,
+                config.get('scope'),
+            )
+        # Legacy plain role-id list — no strategy/scope.
+        return list(config or []), AssignmentService.STRATEGY_RANDOM, None
+
+    @staticmethod
+    def _eligible_users(role_ids, scope, district_code):
+        user_role_model = apps.get_model('core', 'UserRole')
+        user_model = apps.get_model('core', 'User')
+
+        interactive_user_ids = user_role_model.objects.filter(
+            role_id__in=role_ids, *user_role_model.filter_validity()
+        ).values_list('user_id', flat=True).distinct()
+
+        if scope == 'district' and district_code:
+            user_district_model = apps.get_model('location', 'UserDistrict')
+            interactive_user_ids = user_district_model.objects.filter(
+                user_id__in=interactive_user_ids,
+                location__code=district_code,
+                *user_district_model.filter_validity(),
+            ).values_list('user_id', flat=True).distinct()
+
+        return list(
+            user_model.objects.filter(i_user_id__in=interactive_user_ids, i_user__isnull=False).distinct()
+        )
+
+    @classmethod
+    def _pick(cls, candidates, strategy, category):
+        if strategy == cls.STRATEGY_LEAST_LOADED:
+            open_statuses = [s for s in Ticket.TicketStatus.values if s not in cls._TERMINAL_STATUSES]
+            return min(
+                candidates,
+                key=lambda u: Ticket.objects.filter(attending_staff=u, status__in=open_statuses).count(),
+            )
+        if strategy == cls.STRATEGY_ROUND_ROBIN:
+            # Stateless rotation: order candidates deterministically and cycle
+            # through them based on how many tickets already exist in this
+            # category, rather than persisting a separate counter.
+            ordered = sorted(candidates, key=lambda u: u.id)
+            total_in_category = Ticket.objects.filter(category=category).count()
+            return ordered[total_in_category % len(ordered)]
+        return random.choice(candidates)  # 'random' (default)
+
+
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
 
@@ -169,6 +259,7 @@ class TicketService(BaseService):
         self._apply_derived_district(obj_data)
         self._apply_derived_micro_catchment(obj_data)
         self._apply_derived_project_fields(obj_data)
+        self._apply_auto_assignment(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -460,6 +551,22 @@ class TicketService(BaseService):
 
         if json_ext:
             obj_data['json_ext'] = json_ext
+
+    def _apply_auto_assignment(self, obj_data):
+        """
+        Auto-assign attending_staff via AssignmentService, when the
+        caller hasn't already supplied one.
+        """
+        if obj_data.get('attending_staff') or obj_data.get('attending_staff_id'):
+            return
+        category = obj_data.get('category')
+        if not category:
+            return
+
+        district_code = (obj_data.get('json_ext') or {}).get('district_code')
+        assignee = AssignmentService.get_assignee(category, district_code)
+        if assignee:
+            obj_data['attending_staff'] = assignee
 
 
 class CommentService:
