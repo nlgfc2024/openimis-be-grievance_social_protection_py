@@ -31,6 +31,8 @@ DENORMALIZED_REPORTER_JSON_EXT_FIELDS = (
     'location_name',
     'traditional_authority_name',
     'group_village_head_name',
+    'traditional_authority_code',
+    'group_village_head_code',
 )
 
 # Safety cap on hierarchy walk depth, guarding against a parent cycle in
@@ -63,6 +65,33 @@ def _resolve_district_ancestor(location_code):
     return None, None
 
 
+def _resolve_micro_catchment(gvh_code, ta_code):
+    """
+    Resolve the micro-catchment name from the reporter's Group Village
+    Head code, falling back to their Traditional Authority
+    code, via the location.MicroCatchmentGVH /
+    MicroCatchmentTA link tables. Returns None if no code is given or no
+    mapping exists.
+    """
+    if gvh_code:
+        micro_catchment_gvh_model = apps.get_model('location', 'MicroCatchmentGVH')
+        link = micro_catchment_gvh_model.objects.filter(
+            *micro_catchment_gvh_model.filter_validity(), location__code=gvh_code
+        ).select_related('micro_catchment').first()
+        if link:
+            return link.micro_catchment.name
+
+    if ta_code:
+        micro_catchment_ta_model = apps.get_model('location', 'MicroCatchmentTA')
+        link = micro_catchment_ta_model.objects.filter(
+            *micro_catchment_ta_model.filter_validity(), location__code=ta_code
+        ).select_related('micro_catchment').first()
+        if link:
+            return link.micro_catchment.name
+
+    return None
+
+
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
 
@@ -91,6 +120,7 @@ class TicketService(BaseService):
         self._apply_due_date(obj_data)
         self._denormalize_reporter_fields(obj_data)
         self._apply_derived_district(obj_data)
+        self._apply_derived_micro_catchment(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -339,6 +369,24 @@ class TicketService(BaseService):
         if district_code:
             json_ext['district_code'] = district_code
             json_ext['district_name'] = district_name
+            obj_data['json_ext'] = json_ext
+
+    def _apply_derived_micro_catchment(self, obj_data):
+        """
+        Derive micro_catchment from the group_village_head_code /
+        traditional_authority_code already denormalised onto ticket.json_ext
+        by _denormalize_reporter_fields. No code, or no mapping found, leaves
+        the ticket without a micro-catchment — no error.
+        """
+        json_ext = obj_data.get('json_ext') or {}
+        gvh_code = json_ext.get('group_village_head_code')
+        ta_code = json_ext.get('traditional_authority_code')
+        if not gvh_code and not ta_code:
+            return
+
+        micro_catchment_name = _resolve_micro_catchment(gvh_code, ta_code)
+        if micro_catchment_name:
+            json_ext['micro_catchment'] = micro_catchment_name
             obj_data['json_ext'] = json_ext
 
 

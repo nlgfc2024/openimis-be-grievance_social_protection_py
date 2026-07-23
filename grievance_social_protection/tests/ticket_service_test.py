@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
-from location.models import Location
+from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA
 
 from grievance_social_protection.models import Ticket
 from grievance_social_protection.services import TicketService
@@ -23,6 +23,7 @@ from grievance_social_protection.tests.test_helpers import (
     restore_grievance_config,
 )
 from core.test_helpers import LogInHelper
+from core.utils import TimeUtils
 from django.utils.translation import gettext as _
 
 
@@ -371,3 +372,98 @@ class TicketDerivedDistrictTest(TestCase):
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertNotIn('district_code', ticket.json_ext)
         orphan_village.delete()
+
+
+class TicketDerivedMicroCatchmentTest(TestCase):
+    """Derive micro_catchment from the participant's GVH code (fallback TA code)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+
+    def setUp(self):
+        now = TimeUtils.now()
+        self.gvh_location = Location.objects.create(code='BE06-W', name='Test GVH Location', type='W')
+        self.ta_location = Location.objects.create(code='BE06-D', name='Test TA Location', type='D')
+
+        self.gvh_micro_catchment = MicroCatchment.objects.create(
+            code='BE06-MC-GVH', name='GVH Micro-Catchment', audit_user_id=-1)
+        MicroCatchmentGVH.objects.create(
+            micro_catchment=self.gvh_micro_catchment, location=self.gvh_location,
+            audit_user_id=-1, validity_from=now)
+
+        self.ta_micro_catchment = MicroCatchment.objects.create(
+            code='BE06-MC-TA', name='TA Micro-Catchment', audit_user_id=-1)
+        MicroCatchmentTA.objects.create(
+            micro_catchment=self.ta_micro_catchment, location=self.ta_location,
+            audit_user_id=-1, validity_from=now)
+
+    def tearDown(self):
+        MicroCatchmentGVH.objects.filter(location__code__startswith='BE06-').delete()
+        MicroCatchmentTA.objects.filter(location__code__startswith='BE06-').delete()
+        MicroCatchment.objects.filter(code__startswith='BE06-').delete()
+        Location.objects.filter(code__startswith='BE06-').delete()
+
+    def test_micro_catchment_derived_from_gvh_code(self):
+        individual = create_test_individual(self.user, json_ext={
+            'group_village_head_code': self.gvh_location.code,
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "GVH micro-catchment",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('micro_catchment'), 'GVH Micro-Catchment')
+
+    def test_micro_catchment_falls_back_to_ta_code(self):
+        individual = create_test_individual(self.user, json_ext={
+            'traditional_authority_code': self.ta_location.code,
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "TA micro-catchment fallback",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('micro_catchment'), 'TA Micro-Catchment')
+
+    def test_gvh_code_takes_precedence_over_ta_code(self):
+        individual = create_test_individual(self.user, json_ext={
+            'group_village_head_code': self.gvh_location.code,
+            'traditional_authority_code': self.ta_location.code,
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "GVH precedence",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('micro_catchment'), 'GVH Micro-Catchment')
+
+    def test_no_mapping_found_no_error(self):
+        individual = create_test_individual(self.user, json_ext={
+            'group_village_head_code': 'BE06-UNMAPPED',
+        })
+        result = self.service.create({
+            "category": "Default",
+            "title": "No mapping",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertNotIn('micro_catchment', ticket.json_ext)
