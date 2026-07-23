@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
@@ -236,3 +237,61 @@ class TicketReporterDenormalizationTest(TestCase):
         self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertEqual(ticket.json_ext or {}, {})
+
+
+class TicketWageAmountTest(TestCase):
+    """wage_amount storage for partial-wages approval (maker-checker → arrears)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+
+    def test_wage_amount_round_trips(self):
+        result = self.service.create({
+            "category": "Default",
+            "title": "Partial wages",
+            "channel": "Channel A",
+            "wage_amount": "150.50",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.wage_amount, Decimal('150.50'))
+
+    def test_wage_amount_optional(self):
+        result = self.service.create({
+            "category": "Default",
+            "title": "No wage amount",
+            "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertIsNone(ticket.wage_amount)
+
+    def test_wage_amount_rejects_negative(self):
+        with self.assertRaises(ValidationError) as context:
+            self.service.create({
+                "category": "Default",
+                "title": "Negative wage",
+                "channel": "Channel A",
+                "wage_amount": "-10",
+            })
+        self.assertIn(
+            _('validations.TicketValidation.validate_wage_amount.negative_value'),
+            str(context.exception),
+        )
+
+    def test_wage_amount_rejects_non_numeric(self):
+        with self.assertRaises(ValidationError) as context:
+            self.service.create({
+                "category": "Default",
+                "title": "Bad wage",
+                "channel": "Channel A",
+                "wage_amount": "not-a-number",
+            })
+        self.assertIn(
+            _('validations.TicketValidation.validate_wage_amount.invalid_format'),
+            str(context.exception),
+        )
