@@ -92,6 +92,53 @@ def _resolve_micro_catchment(gvh_code, ta_code):
     return None
 
 
+def _resolve_project_name(reporter_type, reporter_id):
+    """
+    Resolve the participant's project (benefit plan) name. Beneficiary
+    reporters use their own benefit plan; individual reporters use their first
+    Beneficiary record's plan (an individual may belong to more than one —
+    first is a reasonable default pending product guidance).
+    """
+    model_object = reporter_type.get_object_for_this_type(pk=reporter_id)
+    if not model_object:
+        return None
+    if reporter_type.name == 'beneficiary':
+        return model_object.benefit_plan.name
+    if reporter_type.name == 'individual':
+        beneficiary = model_object.beneficiary_set.select_related('benefit_plan').first()
+        if beneficiary:
+            return beneficiary.benefit_plan.name
+    return None
+
+
+def _resolve_days_worked(reporter_type, reporter_id):
+    """
+    Resolve total days worked as the count of BeneficiaryProjectTimeEntry
+    rows with percent_complete > 0 across the participant's project enrollments
+    (project_social_protection.BeneficiaryProjectEnrollment/TimeEntry — a
+    cash-for-work program's daily muster roll). Beneficiary reporters use their
+    own enrollments; individual reporters use their first Beneficiary record's,
+    mirroring _resolve_project_name.
+    """
+    model_object = reporter_type.get_object_for_this_type(pk=reporter_id)
+    if not model_object:
+        return None
+
+    if reporter_type.name == 'beneficiary':
+        beneficiary = model_object
+    elif reporter_type.name == 'individual':
+        beneficiary = model_object.beneficiary_set.first()
+    else:
+        beneficiary = None
+    if not beneficiary:
+        return None
+
+    time_entry_model = apps.get_model('project_social_protection', 'BeneficiaryProjectTimeEntry')
+    return time_entry_model.objects.filter(
+        enrollment__beneficiary_id=beneficiary.id, percent_complete__gt=0
+    ).count()
+
+
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
 
@@ -121,6 +168,7 @@ class TicketService(BaseService):
         self._denormalize_reporter_fields(obj_data)
         self._apply_derived_district(obj_data)
         self._apply_derived_micro_catchment(obj_data)
+        self._apply_derived_project_fields(obj_data)
         return super().create(obj_data)
 
     @register_service_signal('ticket_service.update')
@@ -387,6 +435,30 @@ class TicketService(BaseService):
         micro_catchment_name = _resolve_micro_catchment(gvh_code, ta_code)
         if micro_catchment_name:
             json_ext['micro_catchment'] = micro_catchment_name
+            obj_data['json_ext'] = json_ext
+
+    def _apply_derived_project_fields(self, obj_data):
+        """
+        Derive project_name and days_worked from the reporter's
+        benefit plan / project enrollments. No reporter, or nothing found,
+        leaves the ticket without these fields — no error.
+        """
+        reporter_type = obj_data.get('reporter_type')
+        reporter_id = obj_data.get('reporter_id')
+        if not reporter_type or not reporter_id:
+            return
+
+        json_ext = dict(obj_data.get('json_ext') or {})
+
+        project_name = _resolve_project_name(reporter_type, reporter_id)
+        if project_name:
+            json_ext['project_name'] = project_name
+
+        days_worked = _resolve_days_worked(reporter_type, reporter_id)
+        if days_worked is not None:
+            json_ext['days_worked'] = days_worked
+
+        if json_ext:
             obj_data['json_ext'] = json_ext
 
 

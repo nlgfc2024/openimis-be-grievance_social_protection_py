@@ -5,6 +5,10 @@ from django.core.exceptions import ValidationError
 from django.test import TestCase
 
 from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA
+from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
+from project_social_protection.models import (
+    Activity, Project, BeneficiaryProjectEnrollment, BeneficiaryProjectTimeEntry,
+)
 
 from grievance_social_protection.models import Ticket
 from grievance_social_protection.services import TicketService
@@ -467,3 +471,100 @@ class TicketDerivedMicroCatchmentTest(TestCase):
         self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertNotIn('micro_catchment', ticket.json_ext)
+
+
+class TicketDerivedProjectFieldsTest(TestCase):
+    """Derive project_name (benefit plan) and days_worked (project time entries)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls.benefit_plan = BenefitPlan(
+            code='BE07PLN', name='Test Cash Transfer', type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE)
+        cls.benefit_plan.save(user=cls.user)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.benefit_plan.delete()
+        super().tearDownClass()
+
+    def test_beneficiary_reporter_yields_project_name(self):
+        individual = create_test_individual(self.user)
+        beneficiary = Beneficiary(
+            individual=individual, benefit_plan=self.benefit_plan, status=BeneficiaryStatus.ACTIVE)
+        beneficiary.save(user=self.user)
+        result = self.service.create({
+            "category": "Default",
+            "title": "Beneficiary project name",
+            "channel": "Channel A",
+            "reporter_type": "beneficiary",
+            "reporter_id": str(beneficiary.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('project_name'), 'Test Cash Transfer')
+
+    def test_individual_without_beneficiary_no_error(self):
+        individual = create_test_individual(self.user)
+        result = self.service.create({
+            "category": "Default",
+            "title": "No beneficiary link",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertNotIn('project_name', ticket.json_ext or {})
+
+    def test_beneficiary_reporter_yields_days_worked(self):
+        activity = Activity(name='BE07 Activity')
+        activity.save(user=self.user)
+        location = Location.objects.create(code='BE07-V', name='BE07 Village', type='V')
+        project = Project(
+            benefit_plan=self.benefit_plan, name='BE07 Project', activity=activity,
+            location=location, target_beneficiaries=10, working_days=5)
+        project.save(user=self.user)
+
+        individual = create_test_individual(self.user)
+        beneficiary = Beneficiary(
+            individual=individual, benefit_plan=self.benefit_plan, status=BeneficiaryStatus.ACTIVE)
+        beneficiary.save(user=self.user)
+        enrollment = BeneficiaryProjectEnrollment(beneficiary=beneficiary, project=project)
+        enrollment.save(user=self.user)
+
+        # 3 worked days (percent_complete > 0), 1 absent day (0%) that must not count.
+        for day_number, percent_complete in ((1, 100), (2, 50), (3, 0), (4, 25)):
+            entry = BeneficiaryProjectTimeEntry(
+                enrollment=enrollment, day_number=day_number, percent_complete=percent_complete)
+            entry.save(user=self.user)
+
+        result = self.service.create({
+            "category": "Default",
+            "title": "Beneficiary days worked",
+            "channel": "Channel A",
+            "reporter_type": "beneficiary",
+            "reporter_id": str(beneficiary.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('days_worked'), 3)
+
+    def test_beneficiary_without_time_entries_no_error(self):
+        individual = create_test_individual(self.user)
+        beneficiary = Beneficiary(
+            individual=individual, benefit_plan=self.benefit_plan, status=BeneficiaryStatus.ACTIVE)
+        beneficiary.save(user=self.user)
+        result = self.service.create({
+            "category": "Default",
+            "title": "No time entries",
+            "channel": "Channel A",
+            "reporter_type": "beneficiary",
+            "reporter_id": str(beneficiary.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('days_worked'), 0)
