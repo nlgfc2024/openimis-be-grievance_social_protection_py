@@ -60,6 +60,15 @@ class TicketServiceTest(TestCase):
         exception = context.exception
         self.assertIn(_('validations.TicketValidation.validate_resolution.invalid_hour_value'), str(exception))
 
+    def test_ticket_status_accepts_referred(self):
+        """REFERRED is a valid Ticket status and round-trips through the DB."""
+        self.assertIn('REFERRED', Ticket.TicketStatus.values)
+        ticket = create_ticket(self.user)
+        ticket.status = Ticket.TicketStatus.REFERRED
+        ticket.save(user=self.user)
+        reloaded = self.query_all.get(id=ticket.id)
+        self.assertEqual(reloaded.status, Ticket.TicketStatus.REFERRED)
+
     def test_update_ticket(self):
         update_payload = {
             "id": self.ticket.uuid,

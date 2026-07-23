@@ -24,6 +24,7 @@ class Ticket(HistoryBusinessModel):
         RECEIVED = 'RECEIVED', 'Received'
         OPEN = 'OPEN', 'Open'
         IN_PROGRESS = 'IN_PROGRESS', 'In Progress'
+        REFERRED = 'REFERRED', 'Referred'
         RESOLVED = 'RESOLVED', 'Resolved'
         CLOSED = 'CLOSED', 'Closed'
 
