@@ -1,4 +1,5 @@
 import re
+from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext as _
@@ -107,6 +108,25 @@ def validate_resolution(data):
             return {"message": _("validations.TicketValidation.validate_resolution.invalid_day_value")}
         if not (0 <= hours < 24):
             return {"message": _("validations.TicketValidation.validate_resolution.invalid_hour_value")}
+
+    return None
+
+
+def validate_wage_amount(data):
+    """
+    Validates that `wage_amount`, if provided, is a non-negative numeric value
+    """
+    wage_amount = data.get('wage_amount')
+    if wage_amount in (None, ''):
+        return None
+
+    try:
+        value = Decimal(str(wage_amount))
+    except (InvalidOperation, ValueError, TypeError):
+        return {"message": _("validations.TicketValidation.validate_wage_amount.invalid_format")}
+
+    if value < 0:
+        return {"message": _("validations.TicketValidation.validate_wage_amount.negative_value")}
 
     return None
 

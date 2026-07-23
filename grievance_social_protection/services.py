@@ -14,6 +14,7 @@ from grievance_social_protection.validations import (
     TicketValidation,
     CommentValidation,
     validate_resolution,
+    validate_wage_amount,
     parse_resolution_time
 )
 from grievance_social_protection.access_control import GrievanceAccessControl
@@ -53,6 +54,9 @@ class TicketService(BaseService):
         resolution_error = validate_resolution(obj_data)
         if resolution_error:
             raise ValidationError(resolution_error)
+        wage_amount_error = validate_wage_amount(obj_data)
+        if wage_amount_error:
+            raise ValidationError(wage_amount_error)
         self._apply_default_status(obj_data)
         self._apply_due_date(obj_data)
         self._denormalize_reporter_fields(obj_data)
@@ -69,6 +73,9 @@ class TicketService(BaseService):
         resolution_error = validate_resolution(obj_data)
         if resolution_error:
             raise ValidationError(resolution_error)
+        wage_amount_error = validate_wage_amount(obj_data)
+        if wage_amount_error:
+            raise ValidationError(wage_amount_error)
         return super().update(obj_data)
 
     @register_service_signal('ticket_service.delete')
