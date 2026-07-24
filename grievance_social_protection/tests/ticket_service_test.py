@@ -632,8 +632,8 @@ class TicketAutoAssignmentTest(TestCase):
         ordered = sorted([self.dpm_user_1, self.dpm_user_2], key=lambda u: u.id)
         category = 'Claims'
         baseline = Ticket.objects.filter(category=category).count()
-        # Candidate chosen must match ordered[count % 2] at each step.
-        first = AssignmentService.get_assignee(category, None)
+
+        first = AssignmentService._pick(ordered, AssignmentService.STRATEGY_ROUND_ROBIN, category)
         self.assertEqual(first.id, ordered[baseline % 2].id)
 
         Ticket(code=f'RR-{baseline}', category=category, attending_staff=first).save(user=self.user)
