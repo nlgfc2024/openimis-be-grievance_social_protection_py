@@ -62,7 +62,11 @@ class RestrictedViewTest(openIMISGraphQLTestCase):
                     'permissions': ['restricted_read', 'read', 'create']
                 },
                 'public'
-            ]
+            ],
+            # This test exercises category/flag-based restricted-view
+            # filtering specifically; opt out of view scoping (which
+            # AND-s on top) so it isn't also gated by district/creator scope.
+            'view_scope': {'default': 'all_cases'},
         }
         return setup_grievance_config(cfg)
 

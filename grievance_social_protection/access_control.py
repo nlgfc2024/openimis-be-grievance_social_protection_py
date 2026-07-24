@@ -1,5 +1,6 @@
 import logging
 import re
+from django.apps import apps
 from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 
@@ -298,6 +299,81 @@ class GrievanceAccessControl:
                 )
 
         return queryset
+
+    @classmethod
+    def apply_view_scope(cls, queryset, user):
+        """
+        view-scope on top of the category/flag filtering already applied by filter_ticket_queryset.
+        this can only narrow further, never widen what category/flag access already allowed.
+
+        Scope is derived from the user's roles against view_scope's {all_cases,district_scoped,creator_scoped}_roles, 
+        falling back to view_scope.default when none of those role lists match:
+        - all_cases (and 'none', an opt-out default): no extra restriction.
+        - district_scoped: ticket's json_ext.district_code must be one of
+          the user's districts (location.UserDistrict).
+        - creator_scoped: ticket.user_created must be the user.
+        """
+        if not user or user.is_anonymous:
+            return queryset.none()
+
+        scope = cls._resolve_view_scope(user)
+
+        if scope == 'creator_scoped':
+            return queryset.filter(user_created=user)
+
+        if scope == 'district_scoped':
+            district_codes = cls._user_district_codes(user)
+            if not district_codes:
+                return queryset.none()
+            return queryset.filter(json_ext__district_code__in=district_codes)
+
+        # 'all_cases' and 'none' (opt-out default): no extra restriction.
+        return queryset
+
+    @classmethod
+    def _resolve_view_scope(cls, user):
+        view_scope = TicketConfig.view_scope
+        if not view_scope:
+            # Not configured at all (deployment opted out, or a test that
+            # doesn't touch view_scope): no restriction. Only an explicitly
+            # configured view_scope (even just a 'default') opts into scoping.
+            return 'all_cases'
+
+        i_user = getattr(user, 'i_user', None)
+        user_role_ids = set()
+        if i_user:
+            # UserRole.user is an FK to InteractiveUser, not the core.User wrapper.
+            user_role_model = apps.get_model('core', 'UserRole')
+            user_role_ids = set(
+                user_role_model.objects.filter(
+                    user=i_user, *user_role_model.filter_validity()
+                ).values_list('role_id', flat=True)
+            )
+
+        # Broadest match wins when a user's roles span more than one list.
+        for scope_name, cfg_key in (
+            ('all_cases', 'all_cases_roles'),
+            ('district_scoped', 'district_scoped_roles'),
+            ('creator_scoped', 'creator_scoped_roles'),
+        ):
+            role_ids = set(view_scope.get(cfg_key) or [])
+            if role_ids & user_role_ids:
+                return scope_name
+
+        return view_scope.get('default', 'all_cases')
+
+    @staticmethod
+    def _user_district_codes(user):
+        # UserDistrict.user is an FK to InteractiveUser, not the core.User wrapper.
+        i_user = getattr(user, 'i_user', None)
+        if not i_user:
+            return []
+        user_district_model = apps.get_model('location', 'UserDistrict')
+        return list(
+            user_district_model.objects.filter(
+                user=i_user, *user_district_model.filter_validity()
+            ).values_list('location__code', flat=True)
+        )
 
     @classmethod
     def get_category_defaults(cls, category_name):

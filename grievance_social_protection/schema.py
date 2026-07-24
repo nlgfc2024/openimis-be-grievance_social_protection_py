@@ -70,6 +70,7 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+        query = GrievanceAccessControl.apply_view_scope(query, info.context.user)
 
         return gql_optimizer.query(query, info)
 
@@ -99,6 +100,7 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+        query = GrievanceAccessControl.apply_view_scope(query, info.context.user)
 
         custom_filters = kwargs.get("customFilters")
         if custom_filters:
@@ -134,6 +136,7 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+        query = GrievanceAccessControl.apply_view_scope(query, info.context.user)
 
         return gql_optimizer.query(query, info)
 
