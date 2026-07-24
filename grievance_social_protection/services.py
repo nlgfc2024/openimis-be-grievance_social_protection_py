@@ -19,10 +19,15 @@ from grievance_social_protection.validations import (
     validate_resolution,
     validate_wage_amount,
     validate_status_transition,
+    validate_partial_wages_workflow,
+    is_terminal_status,
     parse_resolution_time
 )
 from grievance_social_protection.access_control import GrievanceAccessControl
 from grievance_social_protection.apps import TicketConfig
+from tasks_management.apps import TasksManagementConfig
+from tasks_management.models import Task
+from tasks_management.services import TaskService, _get_std_task_data_payload
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +235,81 @@ class AssignmentService:
         return random.choice(candidates)  # 'random' (default)
 
 
+# Partial-wages maker-checker -> arrears hand-off.
+PARTIAL_WAGES_TASK_SOURCE = 'grievance_partial_wages_approval'
+PARTIAL_WAGES_TASK_BUSINESS_EVENT = 'grievance_social_protection.partial_wages_approval'
+PARTIAL_WAGES_ON_APPROVED_SIGNAL = 'payroll.benefit_consumption.create'
+ARREARS_BENEFIT_CONSUMPTION_TYPE = 'ARREARS'
+
+def _resolve_individual_for_benefit_consumption(reporter):
+    """Return the Individual behind a ticket's reporter (individual or beneficiary), or None."""
+    if reporter is None:
+        return None
+    individual_model = apps.get_model('individual', 'Individual')
+    if isinstance(reporter, individual_model):
+        return reporter
+    beneficiary_model = apps.get_model('social_protection', 'Beneficiary')
+    if isinstance(reporter, beneficiary_model):
+        return reporter.individual
+    return None
+
+
+def _create_arrears_benefit_consumption(user, ticket):
+    """
+    Create the Payments arrears record for an approved partial-wages case.
+    Returns the BenefitConsumptionService.create() result, or None if the
+    reporter has no resolvable Individual (logged, not raised — the task is
+    already approved at this point, so failing loudly here would strand it).
+    """
+    from payroll.services import BenefitConsumptionService
+
+    individual = _resolve_individual_for_benefit_consumption(ticket.reporter)
+    if not individual:
+        logger.warning(
+            "Cannot create arrears for ticket %s: reporter has no resolvable Individual.",
+            ticket.code,
+        )
+        return None
+
+    return BenefitConsumptionService(user).create({
+        'individual': individual,
+        'code': f"ARREARS-{ticket.code}",
+        'amount': ticket.wage_amount,
+        'type': ARREARS_BENEFIT_CONSUMPTION_TYPE,
+        'date_due': date.today(),
+    })
+
+
+def handle_partial_wages_task_completion(task, user):
+    """
+    React to a partial-wages approval task completing, called from
+    signals.py's 'task_service.complete_task' receiver. On COMPLETED, fire
+    the configured on_approved_signal (creates the arrears record); on
+    FAILED (rejected), do nothing, per the acceptance criteria.
+    """
+    if task.get('business_event') != PARTIAL_WAGES_TASK_BUSINESS_EVENT:
+        return
+    if task.get('status') != Task.Status.COMPLETED:
+        return
+
+    ticket_id = task.get('entity_id')
+    if not ticket_id:
+        return
+    ticket = Ticket.objects.filter(id=ticket_id).first()
+    if not ticket or ticket.wage_amount is None:
+        return
+
+    workflow = TicketService._get_category_workflow(ticket.category) or {}
+    if workflow.get('on_approved_signal') != PARTIAL_WAGES_ON_APPROVED_SIGNAL:
+        logger.warning(
+            "Partial-wages task completed for ticket %s but on_approved_signal "
+            "is not '%s'; no arrears created.", ticket.code, PARTIAL_WAGES_ON_APPROVED_SIGNAL,
+        )
+        return
+
+    _create_arrears_benefit_consumption(user, ticket)
+
+
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
 
@@ -262,7 +342,10 @@ class TicketService(BaseService):
         self._apply_derived_project_fields(obj_data)
         self._apply_auto_assignment(obj_data)
         self._apply_status_transition(obj_data)
-        return super().create(obj_data)
+        self._apply_partial_wages_workflow(obj_data)
+        result = super().create(obj_data)
+        self._create_partial_wages_task_if_needed(result)
+        return result
 
     @register_service_signal('ticket_service.update')
     def update(self, obj_data):
@@ -278,8 +361,12 @@ class TicketService(BaseService):
         wage_amount_error = validate_wage_amount(obj_data)
         if wage_amount_error:
             raise ValidationError(wage_amount_error)
-        self._apply_status_transition(obj_data, existing_ticket=self._get_existing_ticket(obj_data))
-        return super().update(obj_data)
+        existing_ticket = self._get_existing_ticket(obj_data)
+        self._apply_status_transition(obj_data, existing_ticket=existing_ticket)
+        self._apply_partial_wages_workflow(obj_data, existing_ticket=existing_ticket)
+        result = super().update(obj_data)
+        self._create_partial_wages_task_if_needed(result)
+        return result
 
     @register_service_signal('ticket_service.delete')
     def delete(self, obj_data):
@@ -615,15 +702,81 @@ class TicketService(BaseService):
             if 'referred_to' not in json_ext and existing_json_ext.get('referred_to'):
                 json_ext['referred_to'] = existing_json_ext['referred_to']
 
-        terminal_codes = {
-            status['code'] for status in TicketConfig.ticket_statuses or []
-            if isinstance(status, dict) and status.get('terminal')
-        }
-        if new_status in terminal_codes and not existing_json_ext.get('resolved_date'):
+        if is_terminal_status(new_status) and not existing_json_ext.get('resolved_date'):
             json_ext['resolved_date'] = date.today().isoformat()
 
         if json_ext:
             obj_data['json_ext'] = json_ext
+
+    @staticmethod
+    def _get_category_workflow(category):
+        if not category:
+            return None
+        return (TicketConfig.processed_categories or {}).get(category, {}).get('workflow')
+
+    def _apply_partial_wages_workflow(self, obj_data, existing_ticket=None):
+        """
+        Validate the maker-checker precondition before save: if the
+        category's workflow requires an amount and the ticket is moving to a
+        terminal status, wage_amount must be present. The actual tasks_management approval task is
+        created post-save (_create_partial_wages_task_if_needed), once the
+        ticket has a real pk to attach as the task's entity.
+        """
+        category = obj_data.get('category') or (existing_ticket.category if existing_ticket else None)
+        workflow = self._get_category_workflow(category)
+        new_status = obj_data.get('status') or (existing_ticket.status if existing_ticket else None)
+        wage_amount = obj_data.get('wage_amount')
+        if wage_amount is None and existing_ticket:
+            wage_amount = existing_ticket.wage_amount
+
+        error = validate_partial_wages_workflow(workflow, new_status, wage_amount)
+        if error:
+            raise ValidationError(error)
+
+    def _create_partial_wages_task_if_needed(self, result):
+        """
+        Post-save: create the tasks_management approval task (maker step)
+        for a partial-wages resolution, once the ticket is actually saved.
+        A checker later approves/rejects it via tasks_management's own
+        mutations; signals.py reacts to completion.
+        """
+        if not result or not result.get('success'):
+            return
+
+        ticket_id = (result.get('data') or {}).get('id')
+        if not ticket_id:
+            return
+        ticket = Ticket.objects.filter(id=ticket_id).first()
+        if not ticket or ticket.wage_amount is None:
+            return
+
+        workflow = self._get_category_workflow(ticket.category)
+        if not workflow or not workflow.get('maker_checker'):
+            return
+        if not is_terminal_status(ticket.status):
+            return
+        if self._has_existing_partial_wages_task(ticket):
+            return
+
+        TaskService(self.user).create({
+            'source': PARTIAL_WAGES_TASK_SOURCE,
+            'entity': ticket,
+            'status': Task.Status.RECEIVED,
+            'executor_action_event': TasksManagementConfig.default_executor_event,
+            'business_event': PARTIAL_WAGES_TASK_BUSINESS_EVENT,
+            'data': _get_std_task_data_payload({
+                'ticket_code': ticket.code,
+                'wage_amount': ticket.wage_amount,
+            }),
+        })
+
+    @staticmethod
+    def _has_existing_partial_wages_task(ticket):
+        content_type = ContentType.objects.get_for_model(Ticket)
+        return Task.objects.filter(
+            entity_type=content_type, entity_id=str(ticket.id),
+            business_event=PARTIAL_WAGES_TASK_BUSINESS_EVENT,
+        ).exists()
 
 
 class CommentService:

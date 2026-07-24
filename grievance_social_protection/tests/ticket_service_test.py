@@ -1,8 +1,12 @@
 from datetime import date, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
+
+from tasks_management.models import Task
+from tasks_management.services import TaskService
 
 from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA, UserDistrict
 from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
@@ -741,3 +745,126 @@ class TicketStatusTransitionTest(TestCase):
             )
         finally:
             TicketConfig.ticket_statuses = original_statuses
+
+
+class TicketPartialWagesWorkflowTest(TestCase):
+    """
+    Resolving a workflow.maker_checker category with a wage_amount raises a tasks_management approval task; 
+    completing it fires the arrears hand-off (payroll.BenefitConsumptionService.create); rejecting it does nothing.
+    """
+
+    _config_snapshot = None
+    PARTIAL_WAGES_BUSINESS_EVENT = 'grievance_social_protection.partial_wages_approval'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls._config_snapshot = setup_grievance_config({
+            'ticket_statuses': DEFAULT_CFG['ticket_statuses'],
+            'grievance_types': [
+                {
+                    'name': 'Partial wages',
+                    'workflow': {
+                        'maker_checker': True,
+                        'requires_amount': True,
+                        'on_approved_signal': 'payroll.benefit_consumption.create',
+                    },
+                },
+                'no_workflow_category',
+            ],
+        })
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_grievance_config(cls._config_snapshot)
+        super().tearDownClass()
+
+    def _pending_task(self, ticket):
+        return Task.objects.get(business_event=self.PARTIAL_WAGES_BUSINESS_EVENT, entity_id=str(ticket.id))
+
+    def _task_count(self, ticket):
+        return Task.objects.filter(business_event=self.PARTIAL_WAGES_BUSINESS_EVENT, entity_id=str(ticket.id)).count()
+
+    def test_resolving_without_amount_is_rejected(self):
+        with self.assertRaises(ValidationError) as context:
+            self.service.create({
+                "category": "Partial wages", "title": "No amount", "channel": "Channel A",
+                "status": Ticket.TicketStatus.RESOLVED,
+            })
+        self.assertIn(
+            _('validations.TicketValidation.validate_partial_wages_workflow.wage_amount_required'),
+            str(context.exception),
+        )
+
+    def test_resolving_with_amount_creates_one_pending_task(self):
+        result = self.service.create({
+            "category": "Partial wages", "title": "Resolved with amount", "channel": "Channel A",
+            "status": Ticket.TicketStatus.RESOLVED, "wage_amount": "200.00",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+
+        task = self._pending_task(ticket)
+        self.assertEqual(task.status, Task.Status.RECEIVED)
+        self.assertEqual(task.entity_id, str(ticket.id))
+
+    def test_no_duplicate_task_on_unrelated_update(self):
+        result = self.service.create({
+            "category": "Partial wages", "title": "Resolved with amount", "channel": "Channel A",
+            "status": Ticket.TicketStatus.RESOLVED, "wage_amount": "200.00",
+        })
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(self._task_count(ticket), 1)
+
+        result = self.service.update({"id": ticket.uuid, "title": "Renamed"})
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(self._task_count(ticket), 1)
+
+    def test_category_without_maker_checker_creates_no_task(self):
+        result = self.service.create({
+            "category": "no_workflow_category", "title": "Plain resolve", "channel": "Channel A",
+            "status": Ticket.TicketStatus.RESOLVED, "wage_amount": "50.00",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(self._task_count(ticket), 0)
+
+    @patch('payroll.services.BenefitConsumptionService.create')
+    def test_task_completion_fires_arrears_creation(self, mock_bc_create):
+        mock_bc_create.return_value = {'success': True, 'data': {}}
+        individual = create_test_individual(self.user)
+        result = self.service.create({
+            "category": "Partial wages", "title": "Resolved with amount", "channel": "Channel A",
+            "status": Ticket.TicketStatus.RESOLVED, "wage_amount": "300.00",
+            "reporter_type": "individual", "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        task = self._pending_task(ticket)
+
+        complete_result = TaskService(self.user).complete_task({'id': task.id})
+        self.assertTrue(complete_result.get('success', False), complete_result.get('detail', ""))
+
+        mock_bc_create.assert_called_once()
+        payload = mock_bc_create.call_args[0][0]
+        self.assertEqual(payload['individual'], individual)
+        self.assertEqual(payload['amount'], Decimal('300.00'))
+        self.assertEqual(payload['type'], 'ARREARS')
+
+    @patch('payroll.services.BenefitConsumptionService.create')
+    def test_task_rejection_does_not_fire_arrears(self, mock_bc_create):
+        individual = create_test_individual(self.user)
+        result = self.service.create({
+            "category": "Partial wages", "title": "Resolved with amount", "channel": "Channel A",
+            "status": Ticket.TicketStatus.RESOLVED, "wage_amount": "300.00",
+            "reporter_type": "individual", "reporter_id": str(individual.id),
+        })
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        task = self._pending_task(ticket)
+
+        complete_result = TaskService(self.user).complete_task({'id': task.id, 'failed': True})
+        self.assertTrue(complete_result.get('success', False), complete_result.get('detail', ""))
+
+        mock_bc_create.assert_not_called()
