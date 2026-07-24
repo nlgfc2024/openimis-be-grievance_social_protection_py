@@ -1,0 +1,13 @@
+Hello,
+
+You have been assigned a case in the Case Management system.
+
+Case code: {{ ticket.code }}
+Title: {{ ticket.title }}
+Category: {{ ticket.category }}
+Priority: {{ ticket.priority }}
+{% if due_date %}Due date: {{ due_date }}
+{% endif %}
+Please log in to the system to review the case details.
+
+Regards,

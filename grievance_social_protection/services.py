@@ -3,10 +3,13 @@ import random
 from datetime import date, timedelta
 
 from django.apps import apps
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied
+from django.core.mail import send_mail, BadHeaderError
 from django.db.models import Max
 from django.db import transaction
+from django.template import loader
 
 from core.services import BaseService
 from core.signals import register_service_signal
@@ -230,6 +233,48 @@ class AssignmentService:
         return random.choice(candidates)  # 'random' (default)
 
 
+# plain-text template, mirroring core's password_reset.txt convention.
+ASSIGNMENT_NOTIFICATION_TEMPLATE = 'ticket_assignment_notification.txt'
+ASSIGNMENT_NOTIFICATION_SUBJECT = "[OpenIMIS] New case assigned: %s"
+
+
+def _resolve_user_email(user):
+    """Return an email address for a core User (interactive or technical), or None."""
+    if not user:
+        return None
+    i_user = getattr(user, 'i_user', None)
+    if i_user and getattr(i_user, 'email', None):
+        return i_user.email
+    t_user = getattr(user, 't_user', None)
+    if t_user and getattr(t_user, 'email', None):
+        return t_user.email
+    return None
+
+
+def _send_assignment_email(ticket, include_due_date=True):
+    """Email the ticket's attending_staff that they've been assigned a case."""
+    email = _resolve_user_email(ticket.attending_staff)
+    if not email:
+        logger.info(
+            "Assignee '%s' has no email address; skipping assignment notification for ticket %s.",
+            getattr(ticket.attending_staff, 'username', ticket.attending_staff_id), ticket.code,
+        )
+        return
+
+    context = {'ticket': ticket, 'due_date': ticket.due_date if include_due_date else None}
+    try:
+        message = loader.render_to_string(ASSIGNMENT_NOTIFICATION_TEMPLATE, context)
+        send_mail(
+            subject=ASSIGNMENT_NOTIFICATION_SUBJECT % (ticket.code or ticket.title or ticket.uuid),
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+    except BadHeaderError:
+        logger.warning("Invalid header while sending assignment notification for ticket %s.", ticket.code)
+
+
 class TicketService(BaseService):
     OBJECT_TYPE = Ticket
 
@@ -262,7 +307,9 @@ class TicketService(BaseService):
         self._apply_derived_project_fields(obj_data)
         self._apply_auto_assignment(obj_data)
         self._apply_status_transition(obj_data)
-        return super().create(obj_data)
+        result = super().create(obj_data)
+        self._notify_assignee_if_needed(result, previous_attending_staff_id=None)
+        return result
 
     @register_service_signal('ticket_service.update')
     def update(self, obj_data):
@@ -278,8 +325,12 @@ class TicketService(BaseService):
         wage_amount_error = validate_wage_amount(obj_data)
         if wage_amount_error:
             raise ValidationError(wage_amount_error)
-        self._apply_status_transition(obj_data, existing_ticket=self._get_existing_ticket(obj_data))
-        return super().update(obj_data)
+        existing_ticket = self._get_existing_ticket(obj_data)
+        previous_attending_staff_id = existing_ticket.attending_staff_id if existing_ticket else None
+        self._apply_status_transition(obj_data, existing_ticket=existing_ticket)
+        result = super().update(obj_data)
+        self._notify_assignee_if_needed(result, previous_attending_staff_id)
+        return result
 
     @register_service_signal('ticket_service.delete')
     def delete(self, obj_data):
@@ -578,6 +629,34 @@ class TicketService(BaseService):
         assignee = AssignmentService.get_assignee(category, district_code)
         if assignee:
             obj_data['attending_staff'] = assignee
+
+    def _notify_assignee_if_needed(self, result, previous_attending_staff_id=None):
+        """
+        Email the assignee when attending_staff is set/changed, gated
+        by notifications.on_assign and the 'email' channel. Runs after the
+        ticket is actually saved, so it reflects the final persisted state
+        (including auto-assignment). No email when attending_staff is unset,
+        unchanged from before this call, or the config disables it.
+        """
+        if not result or not result.get('success'):
+            return
+
+        notifications_cfg = TicketConfig.notifications or {}
+        if not notifications_cfg.get('on_assign', True):
+            return
+        if 'email' not in (notifications_cfg.get('channels') or []):
+            return
+
+        ticket_id = (result.get('data') or {}).get('id')
+        if not ticket_id:
+            return
+        ticket = Ticket.objects.filter(id=ticket_id).first()
+        if not ticket or not ticket.attending_staff_id:
+            return
+        if ticket.attending_staff_id == previous_attending_staff_id:
+            return
+
+        _send_assignment_email(ticket, include_due_date=notifications_cfg.get('include_due_date', True))
 
     def _apply_status_transition(self, obj_data, existing_ticket=None):
         """
