@@ -741,3 +741,65 @@ class TicketStatusTransitionTest(TestCase):
             )
         finally:
             TicketConfig.ticket_statuses = original_statuses
+
+
+class TicketSeaShRoutingTest(TestCase):
+    """
+    SEA-SH-style categories route to Critical priority and a national-role assignee on create. 
+    This is the combination of the category's own `priority` config (existing _apply_category_defaults, pre-dating this issue) 
+    and AssignmentService honouring scope='national' (no district filtering).
+    Restricted visibility is separately built-in.
+    """
+
+    _config_snapshot = None
+    _original_role_ids_cfg = None
+
+    SEA_SH_CATEGORY = 'Sexual Exploitation and Abuse / Sexual Harassment'
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._original_role_ids_cfg = TicketConfig.default_attending_staff_role_ids
+
+        cls.national_role = create_test_role(name='BE12NationalRole')
+        cls.national_user_1 = create_test_interactive_user(
+            username='be12_national1', roles=[cls.national_role.id])
+        cls.national_user_2 = create_test_interactive_user(
+            username='be12_national2', roles=[cls.national_role.id])
+
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls._config_snapshot = setup_grievance_config({
+            'grievance_types': [
+                {
+                    'name': cls.SEA_SH_CATEGORY,
+                    'priority': 'Critical',
+                    'resolution_times': '0,0',
+                    'permissions': ['restricted_read'],
+                },
+            ],
+        })
+        TicketConfig.default_attending_staff_role_ids = {
+            cls.SEA_SH_CATEGORY: {
+                'role_ids': [cls.national_role.id], 'strategy': 'random', 'scope': 'national',
+            },
+        }
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_grievance_config(cls._config_snapshot)
+        TicketConfig.default_attending_staff_role_ids = cls._original_role_ids_cfg
+        super().tearDownClass()
+
+    def test_sea_sh_ticket_is_critical_and_nationally_assigned(self):
+        result = self.service.create({
+            "category": self.SEA_SH_CATEGORY,
+            "title": "SEA-SH report",
+            "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+
+        self.assertEqual(ticket.priority, 'Critical')
+        self.assertIn(ticket.attending_staff_id, [self.national_user_1.id, self.national_user_2.id])
+        self.assertEqual(ticket.due_date, date.today())
