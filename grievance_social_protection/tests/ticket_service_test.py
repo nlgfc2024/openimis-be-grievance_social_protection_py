@@ -2,8 +2,9 @@ from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.core import mail
 from django.core.exceptions import ValidationError
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from tasks_management.models import Task
 from tasks_management.services import TaskService
@@ -749,7 +750,7 @@ class TicketStatusTransitionTest(TestCase):
 
 class TicketPartialWagesWorkflowTest(TestCase):
     """
-    Resolving a workflow.maker_checker category with a wage_amount raises a tasks_management approval task; 
+    Resolving a workflow.maker_checker category with a wage_amount raises a tasks_management approval task;
     completing it fires the arrears hand-off (payroll.BenefitConsumptionService.create); rejecting it does nothing.
     """
 
@@ -868,3 +869,111 @@ class TicketPartialWagesWorkflowTest(TestCase):
         self.assertTrue(complete_result.get('success', False), complete_result.get('detail', ""))
 
         mock_bc_create.assert_not_called()
+
+
+@override_settings(EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend')
+class TicketAssignmentNotificationTest(TestCase):
+    """Email the assignee when attending_staff is set/changed."""
+
+    _config_snapshot = None
+    _original_role_ids_cfg = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._original_role_ids_cfg = TicketConfig.default_attending_staff_role_ids
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls.assignee = create_test_interactive_user(
+            username='be11_assignee', roles=[create_test_role(name='BE11Role').id],
+            custom_props={'email': 'assignee@example.com'})
+        cls.assignee_2 = create_test_interactive_user(
+            username='be11_assignee2', roles=[create_test_role(name='BE11Role2').id],
+            custom_props={'email': 'assignee2@example.com'})
+        cls.no_email_user = create_test_interactive_user(
+            username='be11_no_email', roles=[create_test_role(name='BE11Role3').id])
+        cls._config_snapshot = setup_grievance_config(DEFAULT_CFG)
+        # Disable auto-assignment so these tests fully control attending_staff via explicit payload values.
+        TicketConfig.default_attending_staff_role_ids = {}
+
+    @classmethod
+    def tearDownClass(cls):
+        restore_grievance_config(cls._config_snapshot)
+        TicketConfig.default_attending_staff_role_ids = cls._original_role_ids_cfg
+        super().tearDownClass()
+
+    def setUp(self):
+        mail.outbox.clear()
+        self._original_notifications = TicketConfig.notifications
+
+    def tearDown(self):
+        TicketConfig.notifications = self._original_notifications
+
+    def _create_unassigned_ticket(self):
+        result = self.service.create({
+            "category": "Default", "title": "Unassigned", "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        return Ticket.objects.get(uuid=result['data']['uuid'])
+
+    def test_assignment_sends_email_with_due_date(self):
+        result = self.service.create({
+            "category": "Default", "title": "Notify test", "channel": "Channel A",
+            "attending_staff_id": self.assignee.id,
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 1)
+        sent = mail.outbox[0]
+        self.assertIn('assignee@example.com', sent.to)
+        self.assertIn(result['data']['code'], sent.subject)
+        self.assertIn('[OpenIMIS]', sent.subject)
+
+    def test_on_assign_false_sends_no_email(self):
+        TicketConfig.notifications = {**self._original_notifications, 'on_assign': False}
+        result = self.service.create({
+            "category": "Default", "title": "No notify", "channel": "Channel A",
+            "attending_staff_id": self.assignee.id,
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_email_channel_not_configured_sends_no_email(self):
+        TicketConfig.notifications = {**self._original_notifications, 'channels': []}
+        result = self.service.create({
+            "category": "Default", "title": "No email channel", "channel": "Channel A",
+            "attending_staff_id": self.assignee.id,
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_reassignment_on_update_sends_email_to_new_assignee(self):
+        ticket = self._create_unassigned_ticket()
+        mail.outbox.clear()
+
+        result = self.service.update({"id": ticket.uuid, "attending_staff_id": self.assignee.id})
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn('assignee@example.com', mail.outbox[0].to)
+
+        mail.outbox.clear()
+        result = self.service.update({"id": ticket.uuid, "attending_staff_id": self.assignee_2.id})
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn('assignee2@example.com', mail.outbox[0].to)
+
+    def test_unrelated_update_does_not_resend_email(self):
+        ticket = self._create_unassigned_ticket()
+        self.service.update({"id": ticket.uuid, "attending_staff_id": self.assignee.id})
+        mail.outbox.clear()
+
+        result = self.service.update({"id": ticket.uuid, "title": "Renamed"})
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_assignee_without_email_sends_nothing_no_crash(self):
+        result = self.service.create({
+            "category": "Default", "title": "No email address", "channel": "Channel A",
+            "attending_staff_id": self.no_email_user.id,
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        self.assertEqual(len(mail.outbox), 0)

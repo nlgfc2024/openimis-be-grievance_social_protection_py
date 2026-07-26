@@ -3,10 +3,13 @@ import random
 from datetime import date, timedelta
 
 from django.apps import apps
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied
+from django.core.mail import send_mail, BadHeaderError
 from django.db.models import Max
 from django.db import transaction
+from django.template import loader
 
 from core.services import BaseService
 from core.signals import register_service_signal
@@ -53,9 +56,10 @@ MAX_LOCATION_ANCESTOR_DEPTH = 4
 
 def _resolve_district_ancestor(location_code):
     """
-    Walk the location hierarchy up from `location_code` to the Region (R)
-    ancestor. Returns (code, name), or (None, None) if the location isn't found or 
-    has no R ancestor.
+    Walk the location hierarchy up from `location_code` to the District (type R)
+    ancestor — in Malawi data type R is the District, not a Region. Returns
+    (code, name), or (None, None) if the location isn't found or has no type-R
+    ancestor.
     """
     if not location_code:
         return None, None
@@ -235,11 +239,63 @@ class AssignmentService:
         return random.choice(candidates)  # 'random' (default)
 
 
+# plain-text template, mirroring core's password_reset.txt convention.
+ASSIGNMENT_NOTIFICATION_TEMPLATE = 'ticket_assignment_notification.txt'
+ASSIGNMENT_NOTIFICATION_SUBJECT = "[OpenIMIS] New case assigned: %s"
+
+
+def _resolve_user_email(user):
+    """Return an email address for a core User (interactive or technical), or None."""
+    if not user:
+        return None
+    i_user = getattr(user, 'i_user', None)
+    if i_user and getattr(i_user, 'email', None):
+        return i_user.email
+    t_user = getattr(user, 't_user', None)
+    if t_user and getattr(t_user, 'email', None):
+        return t_user.email
+    return None
+
+
+def _send_assignment_email(ticket, include_due_date=True):
+    """Email the ticket's attending_staff that they've been assigned a case."""
+    email = _resolve_user_email(ticket.attending_staff)
+    if not email:
+        logger.info(
+            "Assignee '%s' has no email address; skipping assignment notification for ticket %s.",
+            getattr(ticket.attending_staff, 'username', ticket.attending_staff_id), ticket.code,
+        )
+        return
+
+    context = {'ticket': ticket, 'due_date': ticket.due_date if include_due_date else None}
+    try:
+        message = loader.render_to_string(ASSIGNMENT_NOTIFICATION_TEMPLATE, context)
+        send_mail(
+            subject=ASSIGNMENT_NOTIFICATION_SUBJECT % (ticket.code or ticket.title or ticket.uuid),
+            message=message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            fail_silently=False,
+        )
+    except BadHeaderError:
+        logger.warning("Invalid header while sending assignment notification for ticket %s.", ticket.code)
+    except Exception as exc:
+        # Notifications are best-effort. This runs after the ticket has already
+        # been saved, and the create/update mutation is wrapped in a
+        # transaction — so letting an SMTP error (mail server down, timeout,
+        # TLS failure, ...) propagate here would roll back the ticket write and
+        # surface a 500 for a ticket that actually persisted. Log and move on.
+        logger.warning(
+            "Failed to send assignment notification for ticket %s: %s", ticket.code, exc,
+        )
+
+
 # Partial-wages maker-checker -> arrears hand-off.
 PARTIAL_WAGES_TASK_SOURCE = 'grievance_partial_wages_approval'
 PARTIAL_WAGES_TASK_BUSINESS_EVENT = 'grievance_social_protection.partial_wages_approval'
 PARTIAL_WAGES_ON_APPROVED_SIGNAL = 'payroll.benefit_consumption.create'
 ARREARS_BENEFIT_CONSUMPTION_TYPE = 'ARREARS'
+
 
 def _resolve_individual_for_benefit_consumption(reporter):
     """Return the Individual behind a ticket's reporter (individual or beneficiary), or None."""
@@ -344,6 +400,7 @@ class TicketService(BaseService):
         self._apply_status_transition(obj_data)
         self._apply_partial_wages_workflow(obj_data)
         result = super().create(obj_data)
+        self._notify_assignee_if_needed(result, previous_attending_staff_id=None)
         self._create_partial_wages_task_if_needed(result)
         return result
 
@@ -362,9 +419,11 @@ class TicketService(BaseService):
         if wage_amount_error:
             raise ValidationError(wage_amount_error)
         existing_ticket = self._get_existing_ticket(obj_data)
+        previous_attending_staff_id = existing_ticket.attending_staff_id if existing_ticket else None
         self._apply_status_transition(obj_data, existing_ticket=existing_ticket)
         self._apply_partial_wages_workflow(obj_data, existing_ticket=existing_ticket)
         result = super().update(obj_data)
+        self._notify_assignee_if_needed(result, previous_attending_staff_id)
         self._create_partial_wages_task_if_needed(result)
         return result
 
@@ -594,8 +653,9 @@ class TicketService(BaseService):
         """
         Derive district_code/district_name from the location_code
         already denormalised onto ticket.json_ext by _denormalize_reporter_fields,
-        walking up to the Region (R) ancestor. No location_code, or no R
-        ancestor found, leaves the ticket without a district — no error.
+        walking up to the District (type R) ancestor — in Malawi data type R is
+        the District, not a Region. No location_code, or no type-R ancestor
+        found, leaves the ticket without a district — no error.
         """
         json_ext = obj_data.get('json_ext') or {}
         location_code = json_ext.get('location_code')
@@ -666,6 +726,34 @@ class TicketService(BaseService):
         if assignee:
             obj_data['attending_staff'] = assignee
 
+    def _notify_assignee_if_needed(self, result, previous_attending_staff_id=None):
+        """
+        Email the assignee when attending_staff is set/changed, gated
+        by notifications.on_assign and the 'email' channel. Runs after the
+        ticket is actually saved, so it reflects the final persisted state
+        (including auto-assignment). No email when attending_staff is unset,
+        unchanged from before this call, or the config disables it.
+        """
+        if not result or not result.get('success'):
+            return
+
+        notifications_cfg = TicketConfig.notifications or {}
+        if not notifications_cfg.get('on_assign', True):
+            return
+        if 'email' not in (notifications_cfg.get('channels') or []):
+            return
+
+        ticket_id = (result.get('data') or {}).get('id')
+        if not ticket_id:
+            return
+        ticket = Ticket.objects.filter(id=ticket_id).first()
+        if not ticket or not ticket.attending_staff_id:
+            return
+        if ticket.attending_staff_id == previous_attending_staff_id:
+            return
+
+        _send_assignment_email(ticket, include_due_date=notifications_cfg.get('include_due_date', True))
+
     def _apply_status_transition(self, obj_data, existing_ticket=None):
         """
         Validate + apply status-transition side effects:
@@ -691,7 +779,11 @@ class TicketService(BaseService):
             raise ValidationError(transition_error)
 
         existing_json_ext = (existing_ticket.json_ext if existing_ticket else None) or {}
-        json_ext = dict(obj_data.get('json_ext') or existing_json_ext)
+        # Merge onto the existing json_ext so the create-time derived fields
+        # (district_code, project_name, micro_catchment, ...) survive a partial
+        # payload update instead of being replaced wholesale by an incoming
+        # json_ext that only carries a subset of keys.
+        json_ext = {**existing_json_ext, **(obj_data.get('json_ext') or {})}
 
         if new_status == Ticket.TicketStatus.REFERRED:
             json_ext['was_referred'] = True
