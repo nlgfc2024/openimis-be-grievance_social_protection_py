@@ -273,6 +273,15 @@ def _send_assignment_email(ticket, include_due_date=True):
         )
     except BadHeaderError:
         logger.warning("Invalid header while sending assignment notification for ticket %s.", ticket.code)
+    except Exception as exc:
+        # Notifications are best-effort. This runs after the ticket has already
+        # been saved, and the create/update mutation is wrapped in a
+        # transaction — so letting an SMTP error (mail server down, timeout,
+        # TLS failure, ...) propagate here would roll back the ticket write and
+        # surface a 500 for a ticket that actually persisted. Log and move on.
+        logger.warning(
+            "Failed to send assignment notification for ticket %s: %s", ticket.code, exc,
+        )
 
 
 class TicketService(BaseService):
