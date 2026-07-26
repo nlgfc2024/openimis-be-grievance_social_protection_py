@@ -48,9 +48,10 @@ MAX_LOCATION_ANCESTOR_DEPTH = 4
 
 def _resolve_district_ancestor(location_code):
     """
-    Walk the location hierarchy up from `location_code` to the Region (R)
-    ancestor. Returns (code, name), or (None, None) if the location isn't found or 
-    has no R ancestor.
+    Walk the location hierarchy up from `location_code` to the District (type R)
+    ancestor — in Malawi data type R is the District, not a Region. Returns
+    (code, name), or (None, None) if the location isn't found or has no type-R
+    ancestor.
     """
     if not location_code:
         return None, None
@@ -507,8 +508,9 @@ class TicketService(BaseService):
         """
         Derive district_code/district_name from the location_code
         already denormalised onto ticket.json_ext by _denormalize_reporter_fields,
-        walking up to the Region (R) ancestor. No location_code, or no R
-        ancestor found, leaves the ticket without a district — no error.
+        walking up to the District (type R) ancestor — in Malawi data type R is
+        the District, not a Region. No location_code, or no type-R ancestor
+        found, leaves the ticket without a district — no error.
         """
         json_ext = obj_data.get('json_ext') or {}
         location_code = json_ext.get('location_code')
@@ -604,7 +606,11 @@ class TicketService(BaseService):
             raise ValidationError(transition_error)
 
         existing_json_ext = (existing_ticket.json_ext if existing_ticket else None) or {}
-        json_ext = dict(obj_data.get('json_ext') or existing_json_ext)
+        # Merge onto the existing json_ext so the create-time derived fields
+        # (district_code, project_name, micro_catchment, ...) survive a partial
+        # payload update instead of being replaced wholesale by an incoming
+        # json_ext that only carries a subset of keys.
+        json_ext = {**existing_json_ext, **(obj_data.get('json_ext') or {})}
 
         if new_status == Ticket.TicketStatus.REFERRED:
             json_ext['was_referred'] = True
