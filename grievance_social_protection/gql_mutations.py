@@ -18,6 +18,7 @@ class CreateTicketInputType(OpenIMISMutation.Input):
         RECEIVED = Ticket.TicketStatus.RECEIVED
         OPEN = Ticket.TicketStatus.OPEN
         IN_PROGRESS = Ticket.TicketStatus.IN_PROGRESS
+        REFERRED = Ticket.TicketStatus.REFERRED
         RESOLVED = Ticket.TicketStatus.RESOLVED
         CLOSED = Ticket.TicketStatus.CLOSED
 
@@ -35,6 +36,8 @@ class CreateTicketInputType(OpenIMISMutation.Input):
     flags = graphene.String(required=False)
     channel = graphene.String(required=False)
     resolution = graphene.String(required=False)
+    wage_amount = graphene.Decimal(required=False)
+    referred_to = graphene.String(required=False)
 
 
 class UpdateTicketInputType(CreateTicketInputType):

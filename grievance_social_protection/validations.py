@@ -1,4 +1,5 @@
 import re
+from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext as _
@@ -6,6 +7,7 @@ from django.contrib.contenttypes.models import ContentType
 
 from core.models import User
 from core.validation import BaseModelValidation, ObjectExistsValidationMixin
+from grievance_social_protection.apps import TicketConfig
 from grievance_social_protection.models import Ticket, Comment
 
 
@@ -65,6 +67,27 @@ def validate_ticket_exists(data):
     return []
 
 
+RESOLUTION_TIME_PATTERN = re.compile(r"^(?P<days>[0-9]{1,2}),(?P<hours>[0-9]{1,2})$")
+
+
+def parse_resolution_time(value):
+    """
+    Parse a '{days},{hours}' SLA string (as used by resolution_times / resolution)
+    into (days, hours) ints. Returns None if `value` is falsy or out of range,
+    rather than raising — callers use this to opt out of an SLA silently.
+    """
+    if not value:
+        return None
+    match = RESOLUTION_TIME_PATTERN.match(value)
+    if not match:
+        return None
+    days = int(match.group("days"))
+    hours = int(match.group("hours"))
+    if not (0 <= days < 99 and 0 <= hours < 24):
+        return None
+    return days, hours
+
+
 def validate_resolution(data):
     """
     Validates that `value` is in the format '{days},{hours}'
@@ -86,6 +109,56 @@ def validate_resolution(data):
             return {"message": _("validations.TicketValidation.validate_resolution.invalid_day_value")}
         if not (0 <= hours < 24):
             return {"message": _("validations.TicketValidation.validate_resolution.invalid_hour_value")}
+
+    return None
+
+
+def validate_wage_amount(data):
+    """
+    Validates that `wage_amount`, if provided, is a non-negative numeric value
+    """
+    wage_amount = data.get('wage_amount')
+    if wage_amount in (None, ''):
+        return None
+
+    try:
+        value = Decimal(str(wage_amount))
+    except (InvalidOperation, ValueError, TypeError):
+        return {"message": _("validations.TicketValidation.validate_wage_amount.invalid_format")}
+
+    if value < 0:
+        return {"message": _("validations.TicketValidation.validate_wage_amount.negative_value")}
+
+    return None
+
+
+def validate_status_transition(new_status, referred_to):
+    """
+    Validates:
+    - `new_status`, if provided, is one of the deployment's *enabled*
+      ticket_statuses (TicketConfig.ticket_statuses) — not just any valid
+      Ticket.TicketStatus model choice. An empty enabled-list (misconfigured
+      or not yet loaded) skips this check rather than blocking everything.
+    - moving to REFERRED requires `referred_to` to be one of the configured
+      `referral_entities`.
+    """
+    if not new_status:
+        return None
+
+    enabled_codes = {
+        status['code'] for status in TicketConfig.ticket_statuses or []
+        if isinstance(status, dict) and status.get('code')
+    }
+    if enabled_codes and new_status not in enabled_codes:
+        return {
+            "message": _("validations.TicketValidation.validate_status_transition.status_not_enabled")
+            % {"status": new_status}
+        }
+
+    if new_status == Ticket.TicketStatus.REFERRED:
+        referral_entities = TicketConfig.referral_entities or []
+        if not referred_to or referred_to not in referral_entities:
+            return {"message": _("validations.TicketValidation.validate_status_transition.referred_to_required")}
 
     return None
 

@@ -24,6 +24,7 @@ class Ticket(HistoryBusinessModel):
         RECEIVED = 'RECEIVED', 'Received'
         OPEN = 'OPEN', 'Open'
         IN_PROGRESS = 'IN_PROGRESS', 'In Progress'
+        REFERRED = 'REFERRED', 'Referred'
         RESOLVED = 'RESOLVED', 'Resolved'
         CLOSED = 'CLOSED', 'Closed'
 
@@ -48,6 +49,8 @@ class Ticket(HistoryBusinessModel):
     flags = models.CharField(max_length=255, blank=True, null=True)
     channel = models.CharField(max_length=255, blank=True, null=True)
     resolution = models.CharField(max_length=255, blank=True, null=True)
+
+    wage_amount = models.DecimalField(max_digits=18, decimal_places=2, blank=True, null=True)
 
     def clean(self):
         super().clean()

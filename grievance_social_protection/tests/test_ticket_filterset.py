@@ -2,6 +2,7 @@
 Tests for TicketFilterSet — verifies that filter-level field restrictions
 prevent information inference attacks by users with restricted_read access.
 """
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 from django.test import TestCase
@@ -277,3 +278,23 @@ class TicketFilterSetFilterQuerysetTest(TestCase):
         codes = list(result.values_list('code', flat=True))
         self.assertIn('FSTEST001', codes)
         self.assertNotIn('FSTEST002', codes)
+
+    def test_date_created_range_filter(self):
+        """date_created supports gte/lte for date-range search (start/end date filed)."""
+        now = datetime.now()
+        self.ticket_match.date_created = now - timedelta(days=10)
+        self.ticket_match.save(user=self.user_full)
+        self.ticket_other.date_created = now
+        self.ticket_other.save(user=self.user_full)
+
+        cutoff = (now - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+
+        fs_gte = self._build_filterset(self.user_full, {'date_created__gte': cutoff})
+        codes_gte = list(fs_gte.filter_queryset(fs_gte.queryset).values_list('code', flat=True))
+        self.assertNotIn('FSTEST001', codes_gte)
+        self.assertIn('FSTEST002', codes_gte)
+
+        fs_lte = self._build_filterset(self.user_full, {'date_created__lte': cutoff})
+        codes_lte = list(fs_lte.filter_queryset(fs_lte.queryset).values_list('code', flat=True))
+        self.assertIn('FSTEST001', codes_lte)
+        self.assertNotIn('FSTEST002', codes_lte)

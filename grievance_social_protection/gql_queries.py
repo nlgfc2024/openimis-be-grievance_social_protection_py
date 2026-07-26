@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 
 import graphene
 import django_filters
@@ -43,7 +44,7 @@ TICKET_FILTER_FIELDS = {
     'reporter_id': ["exact"],
     "due_date": ["exact", "istartswith", "icontains", "iexact"],
     "date_of_incident": ["exact", "istartswith", "icontains", "iexact"],
-    "date_created": ["exact", "istartswith", "icontains", "iexact"],
+    "date_created": ["exact", "istartswith", "icontains", "iexact", "gte", "lte"],
     **prefix_filterset("attending_staff__", UserGQLType._meta.filter_fields),
 }
 
@@ -146,10 +147,50 @@ class TicketGQLType(DjangoObjectType):
     # Access level for this ticket based on user's rights
     access_level = graphene.String()
 
+    # duration_days is pending (now - created) or resolved (resolved_date - created);
+    duration_days = graphene.Int()
+    # sla_state is 'within' / 'breached' / 'resolved'.         
+    sla_state = graphene.String()
+
     @staticmethod
     def resolve_access_level(root, info):
         user = info.context.user
         return GrievanceAccessControl.get_user_access_level(user, root.category, root.flags)
+
+    @staticmethod
+    def resolve_duration_days(root, info):
+        return TicketGQLType._compute_duration_days(root)
+
+    @staticmethod
+    def resolve_sla_state(root, info):
+        return TicketGQLType._compute_sla_state(root)
+
+    @staticmethod
+    def _resolved_date(root):
+        """Parse the resolved_date stored in json_ext (ISO string), or None."""
+        resolved_date_str = (root.json_ext or {}).get('resolved_date')
+        if not resolved_date_str:
+            return None
+        try:
+            return date.fromisoformat(resolved_date_str)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _compute_duration_days(cls, root):
+        if not root.date_created:
+            return None
+        created = root.date_created.date() if hasattr(root.date_created, 'date') else root.date_created
+        end = cls._resolved_date(root) or date.today()
+        return (end - created).days
+
+    @classmethod
+    def _compute_sla_state(cls, root):
+        if cls._resolved_date(root):
+            return 'resolved'
+        if root.due_date and date.today() > root.due_date:
+            return 'breached'
+        return 'within'
 
     @staticmethod
     def _should_restrict_field(field_name, root, info):
@@ -449,6 +490,8 @@ class CommentGQLType(DjangoObjectType):
 class AttendingStaffRoleGQLType(ObjectType):
     category = graphene.String()
     role_ids = graphene.List(graphene.String)
+    strategy = graphene.String()
+    scope = graphene.String()
 
 
 class ResolutionTimesByCategoryGQLType(ObjectType):
@@ -471,16 +514,42 @@ class GrievanceFlagGQLType(ObjectType):
     permissions = graphene.JSONString()
 
 
+class TicketStatusGQLType(ObjectType):
+    code = graphene.String()
+    label = graphene.String()
+    initial = graphene.Boolean()
+    terminal = graphene.Boolean()
+    requires_referral_entity = graphene.Boolean()
+
+
+class ParticipantFieldGQLType(ObjectType):
+    key = graphene.String()
+    label = graphene.String()
+    source = graphene.String()
+
+
+class SearchResultColumnGQLType(ObjectType):
+    key = graphene.String()
+    label = graphene.String()
+
+
 class GrievanceTypeConfigurationGQLType(ObjectType):
     grievance_types = graphene.List(graphene.String)
     grievance_flags = graphene.List(graphene.String)
     grievance_channels = graphene.List(graphene.String)
     grievance_category_staff_roles = graphene.List(AttendingStaffRoleGQLType)
     grievance_default_resolutions_by_category = graphene.List(ResolutionTimesByCategoryGQLType)
-    # Enhanced fields
     grievance_categories_hierarchical = graphene.List(GrievanceCategoryGQLType)
     grievance_categories_json = graphene.JSONString()
     grievance_flags_detailed = graphene.List(GrievanceFlagGQLType)
+
+    ticket_statuses = graphene.List(TicketStatusGQLType)
+    referral_entities = graphene.List(graphene.String)
+    participant_fields = graphene.List(ParticipantFieldGQLType)
+    search_filters = graphene.List(graphene.String)
+    search_result_columns = graphene.List(SearchResultColumnGQLType)
+    sla = graphene.JSONString()
+    enable_export = graphene.Boolean()
 
     def resolve_grievance_types(self, info):
         # Return accessible categories in flat format for backward compatibility
@@ -538,10 +607,17 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
         return flags
 
     def resolve_grievance_category_staff_roles(self, info):
-        return [
-            AttendingStaffRoleGQLType(category=category_key, role_ids=role_ids)
-            for category_key, role_ids in TicketConfig.default_attending_staff_role_ids.items()
-        ]
+        # default_attending_staff_role_ids values are either a plain role-id
+        # list (legacy) or a {role_ids, strategy, scope} dict
+        from .services import AssignmentService
+
+        result = []
+        for category_key, config in TicketConfig.default_attending_staff_role_ids.items():
+            role_ids, strategy, scope = AssignmentService._parse_config(config)
+            result.append(AttendingStaffRoleGQLType(
+                category=category_key, role_ids=role_ids, strategy=strategy, scope=scope,
+            ))
+        return result
 
     def resolve_grievance_default_resolutions_by_category(self, info):
         resolution_mapping = getattr(
@@ -551,3 +627,42 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
             ResolutionTimesByCategoryGQLType(category=category_key, resolution_time=resolution_time)
             for category_key, resolution_time in resolution_mapping.items()
         ]
+
+    def resolve_ticket_statuses(self, info):
+        return [
+            TicketStatusGQLType(
+                code=status.get('code'),
+                label=status.get('label', status.get('code')),
+                initial=bool(status.get('initial')),
+                terminal=bool(status.get('terminal')),
+                requires_referral_entity=bool(status.get('requires_referral_entity')),
+            )
+            for status in TicketConfig.ticket_statuses or []
+            if isinstance(status, dict) and status.get('code')
+        ]
+
+    def resolve_referral_entities(self, info):
+        return TicketConfig.referral_entities or []
+
+    def resolve_participant_fields(self, info):
+        return [
+            ParticipantFieldGQLType(key=field.get('key'), label=field.get('label'), source=field.get('source'))
+            for field in TicketConfig.participant_fields or []
+            if isinstance(field, dict) and field.get('key')
+        ]
+
+    def resolve_search_filters(self, info):
+        return TicketConfig.search_filters or []
+
+    def resolve_search_result_columns(self, info):
+        return [
+            SearchResultColumnGQLType(key=column.get('key'), label=column.get('label'))
+            for column in TicketConfig.search_result_columns or []
+            if isinstance(column, dict) and column.get('key')
+        ]
+
+    def resolve_sla(self, info):
+        return TicketConfig.sla or {}
+
+    def resolve_enable_export(self, info):
+        return bool(TicketConfig.enable_export)

@@ -1,1 +1,11 @@
-from .ticket_service_test import TicketServiceTest  # noqa: F401
+from .ticket_service_test import (  # noqa: F401
+    TicketServiceTest,
+    TicketDueDateAndStatusTest,
+    TicketReporterDenormalizationTest,
+    TicketWageAmountTest,
+    TicketDerivedDistrictTest,
+    TicketDerivedMicroCatchmentTest,
+    TicketDerivedProjectFieldsTest,
+    TicketAutoAssignmentTest,
+    TicketStatusTransitionTest,
+)
