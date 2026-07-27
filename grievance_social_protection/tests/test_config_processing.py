@@ -418,7 +418,7 @@ class ConfigProcessingTest(TestCase):
     def test_category_workflow_allows_known_signals(self):
         TicketConfig._TicketConfig__validate_category_workflows(
             self._process_workflow_cfg(
-                {'maker_checker': True, 'on_approved_signal': 'payments.arrears.create'}))
+                {'maker_checker': True, 'on_approved_signal': 'payroll.benefit_consumption.create'}))
         TicketConfig._TicketConfig__validate_category_workflows(
             self._process_workflow_cfg({'on_resolve_task': 'tasks_management'}))
 
