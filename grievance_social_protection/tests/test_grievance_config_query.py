@@ -118,6 +118,7 @@ class GrievanceConfigQueryTest(TestCase):
             'Unpaid wages > Partial wages': {
                 'workflow': {
                     'maker_checker': True,
+                    'requires_amount': True,
                     'on_approved_signal': 'payments.arrears.create',
                     'on_resolve_task': 'tasks_management',
                 },
@@ -128,14 +129,16 @@ class GrievanceConfigQueryTest(TestCase):
         workflow = workflows[0]
         self.assertEqual(workflow.category, 'Unpaid wages > Partial wages')
         self.assertTrue(workflow.maker_checker)
+        self.assertTrue(workflow.requires_amount)
         self.assertEqual(workflow.on_approved_signal, 'payments.arrears.create')
         self.assertEqual(workflow.on_resolve_task, 'tasks_management')
 
-    def test_category_workflows_defaults_maker_checker_false(self):
+    def test_category_workflows_defaults_maker_checker_and_requires_amount_false(self):
         TicketConfig.processed_categories = {
             'Partial wages': {'workflow': {'on_resolve_task': 'tasks_management'}},
         }
         workflows = self.config_type.resolve_grievance_category_workflows(None)
         self.assertEqual(len(workflows), 1)
         self.assertFalse(workflows[0].maker_checker)
+        self.assertFalse(workflows[0].requires_amount)
         self.assertIsNone(workflows[0].on_approved_signal)

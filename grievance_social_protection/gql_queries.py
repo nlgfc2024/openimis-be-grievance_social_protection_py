@@ -497,6 +497,7 @@ class AttendingStaffRoleGQLType(ObjectType):
 class CategoryWorkflowGQLType(ObjectType):
     category = graphene.String()
     maker_checker = graphene.Boolean()
+    requires_amount = graphene.Boolean()
     on_approved_signal = graphene.String()
     on_resolve_task = graphene.String()
 
@@ -636,6 +637,7 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
             result.append(CategoryWorkflowGQLType(
                 category=category_key,
                 maker_checker=bool(workflow.get('maker_checker', False)),
+                requires_amount=bool(workflow.get('requires_amount', False)),
                 on_approved_signal=workflow.get('on_approved_signal'),
                 on_resolve_task=workflow.get('on_resolve_task'),
             ))
