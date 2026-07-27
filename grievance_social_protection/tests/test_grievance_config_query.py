@@ -16,7 +16,7 @@ class GrievanceConfigQueryTest(TestCase):
     ATTRS = (
         'ticket_statuses', 'referral_entities', 'participant_fields',
         'search_filters', 'search_result_columns', 'sla', 'enable_export',
-        'default_attending_staff_role_ids',
+        'default_attending_staff_role_ids', 'processed_categories',
     )
 
     def setUp(self):
@@ -105,3 +105,40 @@ class GrievanceConfigQueryTest(TestCase):
         self.assertEqual(roles['Default'].strategy, 'random')
         self.assertEqual(roles['Claims'].role_ids, [5])
         self.assertEqual(roles['Claims'].strategy, 'round_robin')
+
+    def test_category_workflows_omits_categories_without_workflow(self):
+        TicketConfig.processed_categories = {
+            'Unpaid wages': {'workflow': None},
+        }
+        self.assertEqual(self.config_type.resolve_grievance_category_workflows(None), [])
+
+    def test_category_workflows_resolves_configured_workflow(self):
+        TicketConfig.processed_categories = {
+            'Unpaid wages': {'workflow': None},
+            'Unpaid wages > Partial wages': {
+                'workflow': {
+                    'maker_checker': True,
+                    'requires_amount': True,
+                    'on_approved_signal': 'payments.arrears.create',
+                    'on_resolve_task': 'tasks_management',
+                },
+            },
+        }
+        workflows = self.config_type.resolve_grievance_category_workflows(None)
+        self.assertEqual(len(workflows), 1)
+        workflow = workflows[0]
+        self.assertEqual(workflow.category, 'Unpaid wages > Partial wages')
+        self.assertTrue(workflow.maker_checker)
+        self.assertTrue(workflow.requires_amount)
+        self.assertEqual(workflow.on_approved_signal, 'payments.arrears.create')
+        self.assertEqual(workflow.on_resolve_task, 'tasks_management')
+
+    def test_category_workflows_defaults_maker_checker_and_requires_amount_false(self):
+        TicketConfig.processed_categories = {
+            'Partial wages': {'workflow': {'on_resolve_task': 'tasks_management'}},
+        }
+        workflows = self.config_type.resolve_grievance_category_workflows(None)
+        self.assertEqual(len(workflows), 1)
+        self.assertFalse(workflows[0].maker_checker)
+        self.assertFalse(workflows[0].requires_amount)
+        self.assertIsNone(workflows[0].on_approved_signal)

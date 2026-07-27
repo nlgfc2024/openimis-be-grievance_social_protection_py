@@ -494,6 +494,14 @@ class AttendingStaffRoleGQLType(ObjectType):
     scope = graphene.String()
 
 
+class CategoryWorkflowGQLType(ObjectType):
+    category = graphene.String()
+    maker_checker = graphene.Boolean()
+    requires_amount = graphene.Boolean()
+    on_approved_signal = graphene.String()
+    on_resolve_task = graphene.String()
+
+
 class ResolutionTimesByCategoryGQLType(ObjectType):
     category = graphene.String()
     resolution_time = graphene.String()
@@ -538,6 +546,7 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
     grievance_flags = graphene.List(graphene.String)
     grievance_channels = graphene.List(graphene.String)
     grievance_category_staff_roles = graphene.List(AttendingStaffRoleGQLType)
+    grievance_category_workflows = graphene.List(CategoryWorkflowGQLType)
     grievance_default_resolutions_by_category = graphene.List(ResolutionTimesByCategoryGQLType)
     grievance_categories_hierarchical = graphene.List(GrievanceCategoryGQLType)
     grievance_categories_json = graphene.JSONString()
@@ -616,6 +625,21 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
             role_ids, strategy, scope = AssignmentService._parse_config(config)
             result.append(AttendingStaffRoleGQLType(
                 category=category_key, role_ids=role_ids, strategy=strategy, scope=scope,
+            ))
+        return result
+
+    def resolve_grievance_category_workflows(self, info):
+        result = []
+        for category_key, category_info in (TicketConfig.processed_categories or {}).items():
+            workflow = category_info.get('workflow')
+            if not workflow:
+                continue
+            result.append(CategoryWorkflowGQLType(
+                category=category_key,
+                maker_checker=bool(workflow.get('maker_checker', False)),
+                requires_amount=bool(workflow.get('requires_amount', False)),
+                on_approved_signal=workflow.get('on_approved_signal'),
+                on_resolve_task=workflow.get('on_resolve_task'),
             ))
         return result
 
