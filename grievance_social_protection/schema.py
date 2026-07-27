@@ -1,4 +1,5 @@
 import graphene
+import pandas as pd
 from django.contrib.auth.models import AnonymousUser
 
 from core.schema import OrderedDjangoFilterConnectionField
@@ -7,6 +8,7 @@ from django.db.models import Q
 import graphene_django_optimizer as gql_optimizer
 
 from core.custom_filters import CustomFilterWizardStorage
+from core.gql.export_mixin import ExportableQueryMixin
 from core.utils import append_validity_filter
 from .apps import MODULE_NAME
 from .access_control import GrievanceAccessControl
@@ -25,7 +27,31 @@ from django.core.exceptions import PermissionDenied
 from django.utils.translation import gettext_lazy as _
 
 
-class Query(graphene.ObjectType):
+def _unfold_json_ext(data_df):
+    """
+    Flatten json_ext into separate columns, so a caller can request denormalised/reporter fields
+    (e.g. form_number, location_name) by including 'json_ext' in `fields`.
+    Note: computed, non-DB values (e.g. duration_days) aren't reachable via
+    values_list at all and so can't be exported this way — out of scope here.
+    """
+    if 'json_ext' in data_df:
+        df_unfolded = pd.json_normalize(data_df['json_ext'])
+        df_final = pd.concat([data_df, df_unfolded], axis=1)
+        df_final = df_final.drop('json_ext', axis=1)
+        return df_final
+    return data_df
+
+
+class Query(ExportableQueryMixin, graphene.ObjectType):
+    # auto-generates a `tickets_export` field reusing resolve_tickets
+    # (and therefore its category/flag access control + view scoping)
+    # as the base queryset, then applies the same first-class/custom filters
+    # as the tickets query before writing out a CSV export.
+    export_patches = {'tickets': [_unfold_json_ext]}
+    exportable_fields = ['tickets']
+    module_name = MODULE_NAME
+    object_type = "Ticket"
+
     tickets = OrderedDjangoFilterConnectionField(
         TicketGQLType,
         orderBy=graphene.List(of_type=graphene.String),
@@ -70,6 +96,7 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+        query = GrievanceAccessControl.apply_view_scope(query, info.context.user)
 
         return gql_optimizer.query(query, info)
 
@@ -99,6 +126,7 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+        query = GrievanceAccessControl.apply_view_scope(query, info.context.user)
 
         custom_filters = kwargs.get("customFilters")
         if custom_filters:
@@ -134,6 +162,7 @@ class Query(graphene.ObjectType):
 
         # Apply category and flag permission filtering
         query = GrievanceAccessControl.filter_ticket_queryset(query, info.context.user)
+        query = GrievanceAccessControl.apply_view_scope(query, info.context.user)
 
         return gql_optimizer.query(query, info)
 
@@ -148,6 +177,21 @@ class Query(graphene.ObjectType):
         if not info.context.user.has_perms(TicketConfig.gql_query_tickets_perms):
             raise PermissionDenied(_("unauthorized"))
         return GrievanceTypeConfigurationGQLType()
+
+
+# ExportableQueryMixin auto-generates resolve_tickets_export with no
+# enable_export hook of its own; wrap it so a deployment can disable export
+# without losing the mixin's filtering/permission reuse.
+_auto_resolve_tickets_export = Query.resolve_tickets_export
+
+
+def _resolve_tickets_export_gated(self, info, **kwargs):
+    if not TicketConfig.enable_export:
+        raise PermissionDenied(_("Export is disabled for this deployment."))
+    return _auto_resolve_tickets_export(self, info, **kwargs)
+
+
+Query.resolve_tickets_export = _resolve_tickets_export_gated
 
 
 class Mutation(graphene.ObjectType):

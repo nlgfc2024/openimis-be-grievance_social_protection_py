@@ -1,6 +1,7 @@
 from django.test import TestCase
 
-from core.test_helpers import create_test_interactive_user
+from core.test_helpers import create_test_interactive_user, create_test_role
+from location.models import Location, UserDistrict
 from grievance_social_protection.apps import TicketConfig
 from grievance_social_protection.models import Ticket
 from grievance_social_protection.tests.test_helpers import (
@@ -54,7 +55,10 @@ class TicketQueryFilteringTest(TestCase):
                     'name': 'confidential',
                     'permissions': ['restricted_read', 'read']
                 }
-            ]
+            ],
+            # This test exercises category/flag-based filtering specifically;
+            # opt out of view scoping (which AND-s on top) so it isn't also gated by district/creator scope.
+            'view_scope': {'default': 'all_cases'},
         }
         return setup_grievance_config(cfg)
 
@@ -218,3 +222,106 @@ class TicketQueryFilteringTest(TestCase):
         finally:
             parent_ticket.delete(username=self.user_limited.username)
             child_ticket.delete(username=self.user_limited.username)
+
+
+class TicketViewScopeTest(TestCase):
+    """View scoping AND-ed on top of category/flag filtering."""
+
+    _config_snapshot = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.district_a = Location.objects.create(code='BE16-DA', name='District A', type='R')
+        cls.district_b = Location.objects.create(code='BE16-DB', name='District B', type='R')
+
+        cls.national_role = create_test_role(name='BE16NationalRole')
+        cls.district_role = create_test_role(name='BE16DistrictRole')
+        cls.digitizer_role = create_test_role(name='BE16DigitizerRole')
+
+        cls.national_user = create_test_interactive_user(username='be16_national', roles=[cls.national_role.id])
+        cls.district_user = create_test_interactive_user(username='be16_district', roles=[cls.district_role.id])
+        cls.digitizer_user = create_test_interactive_user(username='be16_digitizer', roles=[cls.digitizer_role.id])
+
+        UserDistrict.objects.create(
+            user=cls.district_user.i_user, location=cls.district_a,
+            audit_user_id=cls.district_user.i_user.id,
+        )
+
+        cls._config_snapshot = setup_grievance_config({
+            'grievance_types': ['Default'],
+            'view_scope': {
+                'all_cases_roles': [cls.national_role.id],
+                'district_scoped_roles': [cls.district_role.id],
+                'creator_scoped_roles': [cls.digitizer_role.id],
+                'default': 'district_scoped',
+            },
+        })
+
+        cls.ticket_district_a = Ticket(
+            title='In district A', category='Default', json_ext={'district_code': cls.district_a.code},
+        )
+        cls.ticket_district_a.save(user=cls.national_user)
+
+        cls.ticket_district_b = Ticket(
+            title='In district B', category='Default', json_ext={'district_code': cls.district_b.code},
+        )
+        cls.ticket_district_b.save(user=cls.national_user)
+
+        cls.ticket_by_digitizer = Ticket(
+            title='Created by digitizer', category='Default', json_ext={'district_code': cls.district_b.code},
+        )
+        cls.ticket_by_digitizer.save(user=cls.digitizer_user)
+
+        cls._all_ticket_ids = [cls.ticket_district_a.id, cls.ticket_district_b.id, cls.ticket_by_digitizer.id]
+
+    @classmethod
+    def tearDownClass(cls):
+        Ticket.objects.filter(id__in=cls._all_ticket_ids).delete()
+        restore_grievance_config(cls._config_snapshot)
+        Location.objects.filter(code__startswith='BE16-').delete()
+        super().tearDownClass()
+
+    def _visible_ids(self, user):
+        queryset = Ticket.objects.filter(id__in=self._all_ticket_ids)
+        return set(Ticket.get_queryset(queryset, user).values_list('id', flat=True))
+
+    def test_national_user_sees_all(self):
+        self.assertEqual(self._visible_ids(self.national_user), set(self._all_ticket_ids))
+
+    def test_district_user_sees_only_own_district(self):
+        self.assertEqual(self._visible_ids(self.district_user), {self.ticket_district_a.id})
+
+    def test_digitizer_sees_only_self_created(self):
+        self.assertEqual(self._visible_ids(self.digitizer_user), {self.ticket_by_digitizer.id})
+
+    def test_scope_ands_with_category_restriction_never_widens(self):
+        """A district-scoped user without category access still can't see a ticket in their own district."""
+        cfg_snapshot = setup_grievance_config({
+            'grievance_types': [{'name': 'BE16Restricted', 'permissions': ['read', 'create']}],
+            'view_scope': {
+                'district_scoped_roles': [self.district_role.id],
+                'default': 'district_scoped',
+            },
+        })
+        restricted_ticket = Ticket(
+            title='Restricted in district A', category='BE16Restricted',
+            json_ext={'district_code': self.district_a.code},
+        )
+        restricted_ticket.save(user=self.national_user)
+        try:
+            queryset = Ticket.objects.filter(id=restricted_ticket.id)
+            filtered = Ticket.get_queryset(queryset, self.district_user)
+            self.assertEqual(filtered.count(), 0)
+        finally:
+            restricted_ticket.delete(username=self.national_user.username)
+            restore_grievance_config(cfg_snapshot)
+
+    def test_unconfigured_view_scope_defaults_to_all_cases(self):
+        """No view_scope configured at all -> no extra restriction (backward compatible)."""
+        original = TicketConfig.view_scope
+        TicketConfig.view_scope = {}
+        try:
+            self.assertEqual(self._visible_ids(self.district_user), set(self._all_ticket_ids))
+        finally:
+            TicketConfig.view_scope = original

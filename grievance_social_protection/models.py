@@ -83,6 +83,8 @@ class Ticket(HistoryBusinessModel):
         if settings.ROW_SECURITY:
             # Apply category and flag permission filtering
             queryset = GrievanceAccessControl.filter_ticket_queryset(queryset, user)
+            # AND view-scope restriction on top.
+            queryset = GrievanceAccessControl.apply_view_scope(queryset, user)
         return queryset
 
 
