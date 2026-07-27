@@ -163,6 +163,29 @@ def validate_status_transition(new_status, referred_to):
     return None
 
 
+def is_terminal_status(status):
+    """True if `status` is one of the deployment's configured terminal ticket_statuses."""
+    return any(
+        isinstance(s, dict) and s.get('code') == status and s.get('terminal')
+        for s in TicketConfig.ticket_statuses or []
+    )
+
+
+def validate_partial_wages_workflow(workflow, new_status, wage_amount):
+    """
+    Validates the maker-checker precondition: when a category's
+    workflow requires an amount (workflow.requires_amount) and the ticket is
+    moving to a terminal status, wage_amount must be present.
+    """
+    if not workflow or not workflow.get('maker_checker'):
+        return None
+    if not is_terminal_status(new_status):
+        return None
+    if workflow.get('requires_amount') and wage_amount is None:
+        return {"message": _("validations.TicketValidation.validate_partial_wages_workflow.wage_amount_required")}
+    return None
+
+
 def validate_commenter_exists(data):
     commenter_type = data.get('commenter_type')
     commenter_id = data.get('commenter_id')

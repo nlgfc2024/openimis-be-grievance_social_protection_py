@@ -21,7 +21,7 @@ CATEGORY_SEPARATOR = ' > '
 VALID_ASSIGNMENT_STRATEGIES = frozenset({'random', 'round_robin', 'least_loaded'})
 VALID_ASSIGNMENT_SCOPES = frozenset({'district', 'national'})
 VALID_VIEW_SCOPE_DEFAULTS = frozenset({'all_cases', 'district_scoped', 'creator_scoped', 'none'})
-ALLOWED_WORKFLOW_APPROVED_SIGNALS = frozenset({'payments.arrears.create'})
+ALLOWED_WORKFLOW_APPROVED_SIGNALS = frozenset({'payroll.benefit_consumption.create'})
 ALLOWED_WORKFLOW_RESOLVE_TASKS = frozenset({'tasks_management'})
 
 DEFAULT_CFG = {

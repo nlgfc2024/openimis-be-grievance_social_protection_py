@@ -51,7 +51,11 @@ class ModelSecurityTest(TestCase):
                     'name': 'confidential',
                     'permissions': ['read', 'create']
                 }
-            ]
+            ],
+            # This test exercises category/flag-based model-level security
+            # specifically; opt out of view scoping (which AND-s on
+            # top) so it isn't also gated by district/creator scope.
+            'view_scope': {'default': 'all_cases'},
         }
         return setup_grievance_config(cfg)
 
