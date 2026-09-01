@@ -106,51 +106,87 @@ def _resolve_micro_catchment(gvh_code, ta_code):
     return None
 
 
-def _resolve_project_name(reporter_type, reporter_id):
+def _resolve_reporter_beneficiary(reporter_type, reporter_id):
     """
-    Resolve the participant's project (benefit plan) name. Beneficiary
-    reporters use their own benefit plan; individual reporters use their first
-    Beneficiary record's plan (an individual may belong to more than one —
-    first is a reasonable default pending product guidance).
+    Resolve the reporter to the social-protection enrolment record its derived
+    project fields hang off — at most one of the two returned handles is set:
+
+      (individual_beneficiary, None)  — INDIVIDUAL benefit plans
+      (None, group_beneficiary)       — GROUP benefit plans (the reporter is a
+                                        household member; enrolment is at the
+                                        household / GroupBeneficiary level)
+
+    A ``beneficiary`` reporter *is* an individual Beneficiary. An ``individual``
+    reporter resolves to their first individual Beneficiary, or failing that to
+    the first GroupBeneficiary of a group they belong to. ``user`` reporters and
+    unenrolled individuals resolve to ``(None, None)``.
     """
     model_object = reporter_type.get_object_for_this_type(pk=reporter_id)
     if not model_object:
-        return None
+        return None, None
+
     if reporter_type.name == 'beneficiary':
-        return model_object.benefit_plan.name
+        return model_object, None
+
     if reporter_type.name == 'individual':
         beneficiary = model_object.beneficiary_set.select_related('benefit_plan').first()
         if beneficiary:
-            return beneficiary.benefit_plan.name
-    return None
+            return beneficiary, None
+
+        group_beneficiary_model = apps.get_model('social_protection', 'GroupBeneficiary')
+        group_ids = model_object.groupindividuals.filter(
+            is_deleted=False
+        ).values_list('group_id', flat=True)
+        group_beneficiary = group_beneficiary_model.objects.filter(
+            group_id__in=group_ids, is_deleted=False
+        ).select_related('benefit_plan').first()
+        return None, group_beneficiary
+
+    return None, None
+
+
+def _resolve_project_name(reporter_type, reporter_id):
+    """
+    Resolve the participant's project (benefit plan) name. Individual and group
+    reporters both fall back through _resolve_reporter_beneficiary (an individual
+    may belong to more than one plan — first is a reasonable default pending
+    product guidance).
+    """
+    beneficiary, group_beneficiary = _resolve_reporter_beneficiary(reporter_type, reporter_id)
+    enrolment = beneficiary or group_beneficiary
+    return enrolment.benefit_plan.name if enrolment else None
 
 
 def _resolve_days_worked(reporter_type, reporter_id):
     """
-    Resolve total days worked as the count of BeneficiaryProjectTimeEntry
-    rows with percent_complete > 0 across the participant's project enrollments
-    (project_social_protection.BeneficiaryProjectEnrollment/TimeEntry — a
-    cash-for-work program's daily muster roll). Beneficiary reporters use their
-    own enrollments; individual reporters use their first Beneficiary record's,
-    mirroring _resolve_project_name.
+    Resolve total days worked as the count of project time-entry rows with
+    percent_complete > 0 across the participant's project enrolments
+    (project_social_protection *ProjectTimeEntry — a cash-for-work program's
+    daily muster roll). INDIVIDUAL-plan reporters count their individual
+    Beneficiary's entries; GROUP-plan reporters (household members) count their
+    household's GroupBeneficiary entries.
     """
-    model_object = reporter_type.get_object_for_this_type(pk=reporter_id)
-    if not model_object:
-        return None
+    beneficiary, group_beneficiary = _resolve_reporter_beneficiary(reporter_type, reporter_id)
 
-    if reporter_type.name == 'beneficiary':
-        beneficiary = model_object
-    elif reporter_type.name == 'individual':
-        beneficiary = model_object.beneficiary_set.first()
-    else:
-        beneficiary = None
-    if not beneficiary:
-        return None
+    if beneficiary:
+        time_entry_model = apps.get_model('project_social_protection', 'BeneficiaryProjectTimeEntry')
+        return time_entry_model.objects.filter(
+            enrollment__beneficiary_id=beneficiary.id,
+            enrollment__is_deleted=False,
+            is_deleted=False,
+            percent_complete__gt=0,
+        ).count()
 
-    time_entry_model = apps.get_model('project_social_protection', 'BeneficiaryProjectTimeEntry')
-    return time_entry_model.objects.filter(
-        enrollment__beneficiary_id=beneficiary.id, percent_complete__gt=0
-    ).count()
+    if group_beneficiary:
+        time_entry_model = apps.get_model('project_social_protection', 'GroupBeneficiaryProjectTimeEntry')
+        return time_entry_model.objects.filter(
+            enrollment__group_beneficiary_id=group_beneficiary.id,
+            enrollment__is_deleted=False,
+            is_deleted=False,
+            percent_complete__gt=0,
+        ).count()
+
+    return None
 
 
 class AssignmentService:
