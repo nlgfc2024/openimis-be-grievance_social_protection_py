@@ -309,13 +309,26 @@ later needs to be a real participant, that should be an explicit, human-reviewed
 ### Derived participant fields
 
 On create, `TicketService` denormalises the reporter's participant details into
-`ticket.json_ext` — including `project_name` and `days_worked`, resolved from
-`project_social_protection` enrolment / time-entry tables (individual
-`Beneficiary…` records for `INDIVIDUAL` plans, `GroupBeneficiary…` records for
-`GROUP` / PWP plans, following the reporter individual → household → project
-chain). This runs as the ticket service rather than the requesting user, so it
-needs no extra rights, but `social_protection` and `project_social_protection`
-must be installed. Missing data is skipped silently.
+`ticket.json_ext`:
+
+- `district_code` / `district_name` — walked up the `location` tree from the
+  reporter's village to the District (type `R`) ancestor;
+- `micro_catchment` — from the reporter's GVH / TA via the
+  `location.MicroCatchmentGVH` / `MicroCatchmentTA` link tables;
+- `project_name` — the reporter's benefit-plan name;
+- `days_worked` — count of project time-entry rows with `percent_complete > 0`;
+- `hotspot_name` — the `hotspot` of the reporter's first enrolled project.
+
+The project-derived values follow the reporter individual → (individual
+`Beneficiary` for `INDIVIDUAL` plans, or household → `GroupBeneficiary` for
+`GROUP` / PWP plans) → enrolment chain. This runs as the ticket service, not the
+requesting user, so it needs no extra rights, but `social_protection` and
+`project_social_protection` must be installed. Missing data is skipped silently.
+
+The `grievanceReporterDerivedFields(reporterType, reporterId)` query returns the
+same `json_ext` **without persisting anything**, so the intake form can show
+district / micro-catchment / project / hotspot for the selected reporter before
+the grievance is saved. It is gated by `gql_query_tickets_perms` (`127000`).
 
 ## GraphQL API
 

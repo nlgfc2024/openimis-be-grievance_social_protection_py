@@ -75,6 +75,14 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
 
     grievance_config = graphene.Field(GrievanceTypeConfigurationGQLType)
 
+    # Participant json_ext a ticket would get for the given reporter, without
+    # creating one — lets the intake form show district / catchment / project /
+    # hotspot before save.
+    grievance_reporter_derived_fields = graphene.JSONString(
+        reporter_type=graphene.String(required=True),
+        reporter_id=graphene.String(required=True),
+    )
+
     comments = OrderedDjangoFilterConnectionField(
         CommentGQLType,
         orderBy=graphene.List(of_type=graphene.String),
@@ -177,6 +185,13 @@ class Query(ExportableQueryMixin, graphene.ObjectType):
         if not info.context.user.has_perms(TicketConfig.gql_query_tickets_perms):
             raise PermissionDenied(_("unauthorized"))
         return GrievanceTypeConfigurationGQLType()
+
+    def resolve_grievance_reporter_derived_fields(self, info, reporter_type, reporter_id, **kwargs):
+        user = info.context.user
+        if isinstance(user, AnonymousUser) or not user.has_perms(TicketConfig.gql_query_tickets_perms):
+            raise PermissionDenied(_("unauthorized"))
+        from .services import TicketService
+        return TicketService(user).preview_reporter_derived_fields(reporter_type, reporter_id)
 
 
 # ExportableQueryMixin auto-generates resolve_tickets_export with no
