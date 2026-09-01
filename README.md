@@ -254,6 +254,35 @@ Flags are single-level configurations only and do NOT support hierarchical/neste
 - Child categories inherit parent permissions unless explicitly overridden
 - Grievances queries are automatically filtered based on user permissions
 
+### Reporter capture — cross-module read permissions
+
+The grievance intake form lets the officer identify the reporter as an
+**individual** (anyone, registered or not) or a **beneficiary** (an individual
+enrolled in a phase and one of that phase's projects). The beneficiary path
+reads from other modules, so a grievance-officer role that creates
+beneficiary-reporter tickets must **also** hold:
+
+| Right    | Module                     | Used for |
+|----------|----------------------------|----------|
+| `160001` | `social_protection`        | Phase (benefit plan) picker — `gql_benefit_plan_search_perms` |
+| `209001` | `project_social_protection`| Project picker and the enrolled-household lookup (`projectEligibleGroupBeneficiaries` / `project`) — `gql_project_search_perms` |
+| individual read | `individual`         | Household-member picker (`individual(groupId:)`); grievance officers normally have this already |
+
+These rights are read-only and gate only the **creation** form. Viewing or
+updating an existing grievance does not require them. The plain *individual*
+reporter path and `user` reporters need none of them.
+
+### Derived participant fields
+
+On create, `TicketService` denormalises the reporter's participant details into
+`ticket.json_ext` — including `project_name` and `days_worked`, resolved from
+`project_social_protection` enrolment / time-entry tables (individual
+`Beneficiary…` records for `INDIVIDUAL` plans, `GroupBeneficiary…` records for
+`GROUP` / PWP plans, following the reporter individual → household → project
+chain). This runs as the ticket service rather than the requesting user, so it
+needs no extra rights, but `social_protection` and `project_social_protection`
+must be installed. Missing data is skipped silently.
+
 ## GraphQL API
 
 ### Configuration Query Fields
