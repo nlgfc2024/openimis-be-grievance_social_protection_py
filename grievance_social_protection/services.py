@@ -474,6 +474,7 @@ class TicketService(BaseService):
             raise ValidationError(wage_amount_error)
         existing_ticket = self._get_existing_ticket(obj_data)
         previous_attending_staff_id = existing_ticket.attending_staff_id if existing_ticket else None
+        self._apply_due_date(obj_data, existing_ticket=existing_ticket)
         self._apply_status_transition(obj_data, existing_ticket=existing_ticket)
         self._apply_partial_wages_workflow(obj_data, existing_ticket=existing_ticket)
         result = super().update(obj_data)
@@ -589,8 +590,18 @@ class TicketService(BaseService):
             obj_data.get('category'), obj_data.get('flags'), access_type
         )
 
+    @staticmethod
+    def _category_resolution_time(category):
+        """The category's configured SLA (`{days},{hours}` string) or None."""
+        if not category:
+            return None
+        return (
+            (TicketConfig.processed_categories or {}).get(category, {}).get('resolution_times')
+            or (TicketConfig.unified_resolution_times or {}).get(category)
+        )
+
     def _apply_category_defaults(self, obj_data):
-        """Apply category defaults (flags, priority) if not already set"""
+        """Apply category defaults (flags, priority, resolution SLA)."""
         category = obj_data.get('category')
         if not category:
             return
@@ -613,6 +624,15 @@ class TicketService(BaseService):
                 category, obj_data.get('flags')
             )
 
+        # Resolution SLA comes from the case type: fill it from the category's
+        # configured resolution_times when the client hasn't supplied one. The
+        # authoritative timer (`due_date`) is always derived category-first in
+        # _apply_due_date regardless of this string.
+        if not obj_data.get('resolution'):
+            category_resolution = self._category_resolution_time(category)
+            if category_resolution:
+                obj_data['resolution'] = category_resolution
+
     def _apply_default_status(self, obj_data):
         """Default new tickets to the configured initial status (OPEN) when unset."""
         if obj_data.get('status'):
@@ -627,34 +647,41 @@ class TicketService(BaseService):
         # Sane fallback if ticket_statuses is misconfigured/empty at runtime
         return Ticket.TicketStatus.OPEN
 
-    def _apply_due_date(self, obj_data):
+    def _apply_due_date(self, obj_data, existing_ticket=None):
         """
-        Auto-compute due_date on create from the category's configured SLA
-        (resolution_times), falling back to the ticket's own `resolution` value
-        when the category has none configured. Categories without any SLA are
-        left without a due_date — no error.
+        Compute due_date from the category's configured SLA (resolution_times),
+        falling back to the ticket's own `resolution` value when the category has
+        none. On create this always runs; on update it only re-computes when the
+        category actually changed (so a case-type correction moves the timer,
+        but a normal edit leaves it alone). Categories without any SLA are left
+        without a due_date — no error.
         """
-        if obj_data.get('due_date'):
-            return
         if not (TicketConfig.sla or {}).get('set_due_date_on_create', True):
             return
 
         category = obj_data.get('category')
-        # processed_categories carries the current resolution_times directly (set
-        # during category processing); unified_resolution_times additionally folds
-        # in the legacy default_resolution mapping for plain-string categories.
-        resolution_time = (TicketConfig.processed_categories or {}).get(category, {}).get('resolution_times')
-        if not resolution_time:
-            resolution_time = (TicketConfig.unified_resolution_times or {}).get(category)
-        if not resolution_time:
-            resolution_time = obj_data.get('resolution')
+        if existing_ticket is not None:
+            # update: only re-derive on a genuine category change
+            if not category or category == existing_ticket.category:
+                return
+        elif obj_data.get('due_date'):
+            # create: respect an explicitly supplied due_date
+            return
 
+        resolution_time = self._category_resolution_time(category) or obj_data.get('resolution')
         parsed = parse_resolution_time(resolution_time)
         if not parsed:
             return
 
         days, hours = parsed
-        due_date = date.today() + timedelta(days=days)
+        # The SLA clock runs from case creation; on a later category correction
+        # keep the same origin rather than restarting from today.
+        origin = (
+            existing_ticket.date_created.date()
+            if existing_ticket is not None and existing_ticket.date_created
+            else date.today()
+        )
+        due_date = origin + timedelta(days=days)
         if hours:
             # due_date is date-only; round a partial-day SLA up to the next day.
             due_date += timedelta(days=1)

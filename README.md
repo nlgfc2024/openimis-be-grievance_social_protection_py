@@ -139,6 +139,21 @@ Resolution times are determined in the following order:
 3. Global `resolution_times` configuration
 4. Default value `5,0` (5 days, 0 hours)
 
+##### How the SLA is applied to a ticket
+
+The SLA is driven by the grievance's **category**, not entered by hand:
+
+- **`resolution`** (the `{days},{hours}` string on the ticket) — `TicketService`
+  fills it from the category's configured resolution time when the client
+  hasn't supplied one. The frontend edit form shows it **read-only** and
+  re-derives it whenever the category is changed.
+- **`due_date`** (the timer) — always computed category-first
+  (`_category_resolution_time(category)` falls back to the ticket's `resolution`
+  only when the category has none). Set on create from the case-creation date;
+  on update it is **only** recomputed when the category actually changes, and it
+  keeps the original creation date as the clock's origin. An explicitly supplied
+  `due_date` is respected on create.
+
 ##### Example Configuration
 ```jsonc
 {
