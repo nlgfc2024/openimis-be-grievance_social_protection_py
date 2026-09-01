@@ -10,9 +10,11 @@ from tasks_management.models import Task
 from tasks_management.services import TaskService
 
 from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA, UserDistrict
-from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
+from individual.models import Group, GroupIndividual
+from social_protection.models import BenefitPlan, Beneficiary, GroupBeneficiary, BeneficiaryStatus
 from project_social_protection.models import (
     Activity, Project, BeneficiaryProjectEnrollment, BeneficiaryProjectTimeEntry,
+    GroupBeneficiaryProjectEnrollment, GroupBeneficiaryProjectTimeEntry,
 )
 
 from grievance_social_protection.models import Ticket
@@ -491,11 +493,50 @@ class TicketDerivedProjectFieldsTest(TestCase):
         cls.benefit_plan = BenefitPlan(
             code='BE07PLN', name='Test Cash Transfer', type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE)
         cls.benefit_plan.save(user=cls.user)
+        cls.group_plan = BenefitPlan(
+            code='BE07GRP', name='PWP Phase 3', type=BenefitPlan.BenefitPlanType.GROUP_TYPE)
+        cls.group_plan.save(user=cls.user)
 
     @classmethod
     def tearDownClass(cls):
+        cls.group_plan.delete()
         cls.benefit_plan.delete()
         super().tearDownClass()
+
+    def _enrolled_household_member(self, *, with_time_entries=None):
+        """
+        Build an Individual who is a member of a household (Group) enrolled, via
+        its GroupBeneficiary, in a project on the GROUP benefit plan. Returns
+        (individual, group_beneficiary, enrollment). `with_time_entries` is an
+        iterable of (day_number, percent_complete) pairs.
+        """
+        individual = create_test_individual(self.user)
+        group = Group(code=f'HH{individual.id.hex[:6]}')
+        group.save(username=self.user.username)
+        GroupIndividual(individual_id=individual.id, group_id=group.id, role='HEAD') \
+            .save(username=self.user.username)
+        group_beneficiary = GroupBeneficiary(
+            group=group, benefit_plan=self.group_plan, status=BeneficiaryStatus.ACTIVE)
+        group_beneficiary.save(user=self.user)
+
+        enrollment = None
+        if with_time_entries is not None:
+            activity = Activity(name='PWP Activity')
+            activity.save(user=self.user)
+            location = Location.objects.create(code='BE07G-V', name='PWP Village', type='V')
+            project = Project(
+                benefit_plan=self.group_plan, name='PWP Phase 3 Project', activity=activity,
+                location=location, target_beneficiaries=10, working_days=5)
+            project.save(user=self.user)
+            enrollment = GroupBeneficiaryProjectEnrollment(
+                group_beneficiary=group_beneficiary, project=project)
+            enrollment.save(user=self.user)
+            for day_number, percent_complete in with_time_entries:
+                GroupBeneficiaryProjectTimeEntry(
+                    enrollment=enrollment, day_number=day_number, percent_complete=percent_complete) \
+                    .save(user=self.user)
+
+        return individual, group_beneficiary, enrollment
 
     def test_beneficiary_reporter_yields_project_name(self):
         individual = create_test_individual(self.user)
@@ -570,6 +611,47 @@ class TicketDerivedProjectFieldsTest(TestCase):
             "channel": "Channel A",
             "reporter_type": "beneficiary",
             "reporter_id": str(beneficiary.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('days_worked'), 0)
+
+    def test_group_member_reporter_yields_project_name(self):
+        individual, _, _ = self._enrolled_household_member()
+        result = self.service.create({
+            "category": "Default",
+            "title": "Group member project name",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('project_name'), 'PWP Phase 3')
+
+    def test_group_member_reporter_yields_days_worked(self):
+        # 3 worked days (percent_complete > 0), 1 absent day (0%) that must not count.
+        individual, _, _ = self._enrolled_household_member(
+            with_time_entries=((1, 100), (2, 50), (3, 0), (4, 25)))
+        result = self.service.create({
+            "category": "Default",
+            "title": "Group member days worked",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('days_worked'), 3)
+
+    def test_group_member_without_enrollment_yields_zero_days(self):
+        individual, _, _ = self._enrolled_household_member()
+        result = self.service.create({
+            "category": "Default",
+            "title": "Group member no enrollment",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
         })
         self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
