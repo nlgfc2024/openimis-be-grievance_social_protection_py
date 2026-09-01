@@ -9,7 +9,7 @@ from django.test import TestCase, override_settings
 from tasks_management.models import Task
 from tasks_management.services import TaskService
 
-from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA, UserDistrict
+from location.models import Location, MicroCatchment, MicroCatchmentGVH, MicroCatchmentTA, Hotspot, UserDistrict
 from individual.models import Group, GroupIndividual
 from social_protection.models import BenefitPlan, Beneficiary, GroupBeneficiary, BeneficiaryStatus
 from project_social_protection.models import (
@@ -541,12 +541,13 @@ class TicketDerivedProjectFieldsTest(TestCase):
         cls.benefit_plan.delete()
         super().tearDownClass()
 
-    def _enrolled_household_member(self, *, with_time_entries=None):
+    def _enrolled_household_member(self, *, with_time_entries=None, with_hotspot=False):
         """
         Build an Individual who is a member of a household (Group) enrolled, via
-        its GroupBeneficiary, in a project on the GROUP benefit plan. Returns
-        (individual, group_beneficiary, enrollment). `with_time_entries` is an
-        iterable of (day_number, percent_complete) pairs.
+        its GroupBeneficiary, in a project on the GROUP benefit plan. An
+        enrollment is created when `with_time_entries` is an iterable (of
+        (day_number, percent_complete) pairs) or `with_hotspot` is True.
+        Returns (individual, group_beneficiary, enrollment).
         """
         individual = create_test_individual(self.user)
         group = Group(code=f'HH{individual.id.hex[:6]}')
@@ -558,18 +559,25 @@ class TicketDerivedProjectFieldsTest(TestCase):
         group_beneficiary.save(user=self.user)
 
         enrollment = None
-        if with_time_entries is not None:
+        if with_time_entries is not None or with_hotspot:
+            suffix = individual.id.hex[:6]
             activity = Activity(name='PWP Activity')
             activity.save(user=self.user)
-            location = Location.objects.create(code='BE07G-V', name='PWP Village', type='V')
+            location = Location.objects.create(code=f'BE07G-V-{suffix}', name='PWP Village', type='V')
+            hotspot = None
+            if with_hotspot:
+                micro_catchment = MicroCatchment.objects.create(
+                    code=f'MC-{suffix}', name='PWP Micro-Catchment', audit_user_id=-1)
+                hotspot = Hotspot.objects.create(
+                    code=f'HS-{suffix}', name='PWP Hotspot', micro_catchment=micro_catchment)
             project = Project(
                 benefit_plan=self.group_plan, name='PWP Phase 3 Project', activity=activity,
-                location=location, target_beneficiaries=10, working_days=5)
+                location=location, target_beneficiaries=10, working_days=5, hotspot=hotspot)
             project.save(user=self.user)
             enrollment = GroupBeneficiaryProjectEnrollment(
                 group_beneficiary=group_beneficiary, project=project)
             enrollment.save(user=self.user)
-            for day_number, percent_complete in with_time_entries:
+            for day_number, percent_complete in (with_time_entries or ()):
                 GroupBeneficiaryProjectTimeEntry(
                     enrollment=enrollment, day_number=day_number, percent_complete=percent_complete) \
                     .save(user=self.user)
@@ -694,6 +702,33 @@ class TicketDerivedProjectFieldsTest(TestCase):
         self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertEqual(ticket.json_ext.get('days_worked'), 0)
+
+    def test_reporter_project_hotspot_denormalized(self):
+        individual, _, _ = self._enrolled_household_member(with_hotspot=True)
+        result = self.service.create({
+            "category": "Default",
+            "title": "Group member hotspot",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('hotspot_name'), 'PWP Hotspot')
+
+    def test_preview_reporter_derived_fields_without_persisting(self):
+        individual, _, _ = self._enrolled_household_member(
+            with_time_entries=((1, 100), (2, 100)), with_hotspot=True)
+        before = Ticket.objects.count()
+        preview = self.service.preview_reporter_derived_fields('individual', str(individual.id))
+        self.assertEqual(Ticket.objects.count(), before)
+        self.assertEqual(preview.get('project_name'), 'PWP Phase 3')
+        self.assertEqual(preview.get('days_worked'), 2)
+        self.assertEqual(preview.get('hotspot_name'), 'PWP Hotspot')
+
+    def test_preview_reporter_derived_fields_unknown_reporter_returns_empty(self):
+        self.assertEqual(self.service.preview_reporter_derived_fields('individual', '0' * 32), {})
+        self.assertEqual(self.service.preview_reporter_derived_fields(None, None), {})
 
 
 class TicketAutoAssignmentTest(TestCase):

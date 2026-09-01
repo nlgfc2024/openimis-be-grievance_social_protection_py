@@ -5,7 +5,7 @@ from datetime import date, timedelta
 from django.apps import apps
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
-from django.core.exceptions import ValidationError, PermissionDenied
+from django.core.exceptions import ValidationError, PermissionDenied, ObjectDoesNotExist
 from django.core.mail import send_mail, BadHeaderError
 from django.db.models import Max
 from django.db import transaction
@@ -187,6 +187,22 @@ def _resolve_days_worked(reporter_type, reporter_id):
         ).count()
 
     return None
+
+
+def _resolve_reporter_project(reporter_type, reporter_id):
+    """
+    The first (individual or group) project the reporter is enrolled in, or
+    None. Used for project-derived fields that need the Project itself (e.g.
+    its hotspot) rather than just the benefit plan.
+    """
+    beneficiary, group_beneficiary = _resolve_reporter_beneficiary(reporter_type, reporter_id)
+    enrolment_holder = beneficiary or group_beneficiary
+    if not enrolment_holder:
+        return None
+    enrollment = enrolment_holder.project_enrollments.filter(
+        is_deleted=False
+    ).select_related('project', 'project__hotspot').first()
+    return enrollment.project if enrollment else None
 
 
 class AssignmentService:
@@ -766,7 +782,7 @@ class TicketService(BaseService):
 
     def _apply_derived_project_fields(self, obj_data):
         """
-        Derive project_name and days_worked from the reporter's
+        Derive project_name, days_worked and hotspot_name from the reporter's
         benefit plan / project enrollments. No reporter, or nothing found,
         leaves the ticket without these fields — no error.
         """
@@ -785,8 +801,33 @@ class TicketService(BaseService):
         if days_worked is not None:
             json_ext['days_worked'] = days_worked
 
+        project = _resolve_reporter_project(reporter_type, reporter_id)
+        if project is not None and project.hotspot_id:
+            json_ext['hotspot_name'] = project.hotspot.name
+
         if json_ext:
             obj_data['json_ext'] = json_ext
+
+    def preview_reporter_derived_fields(self, reporter_type_name, reporter_id):
+        """
+        The participant ``json_ext`` a ticket WOULD receive for this reporter,
+        computed without persisting anything — lets the intake form show
+        district / micro-catchment / project / hotspot before the grievance is
+        saved. Runs the same pipeline as ``create``.
+        """
+        if not reporter_type_name or not reporter_id:
+            return {}
+        obj_data = {'reporter_type': reporter_type_name, 'reporter_id': str(reporter_id)}
+        try:
+            self._get_content_type(obj_data)
+            self._denormalize_reporter_fields(obj_data)
+            self._apply_derived_district(obj_data)
+            self._apply_derived_micro_catchment(obj_data)
+            self._apply_derived_project_fields(obj_data)
+        except (LookupError, ObjectDoesNotExist, ValueError):
+            # Unknown / malformed reporter — nothing to preview, not an error.
+            return {}
+        return obj_data.get('json_ext') or {}
 
     def _apply_auto_assignment(self, obj_data):
         """
