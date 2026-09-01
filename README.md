@@ -272,6 +272,40 @@ These rights are read-only and gate only the **creation** form. Viewing or
 updating an existing grievance does not require them. The plain *individual*
 reporter path and `user` reporters need none of them.
 
+### Walk-in / unregistered reporters
+
+When the reporter is not in the system, the officer captures their details by
+hand (name, date of birth, phone, national ID). These are sent as their own
+mutation fields (`reporterFirstName`, `reporterLastName`, `reporterDob`,
+`reporterPhone`, `reporterNationalId`) and stored by `TicketService` on
+`ticket.json_ext['unregistered_reporter']`, with `national_id` /
+`household_mobile_number` mirrored onto the keys the Custom Filter Wizard and
+participant panel already read. The ticket carries **no** `reporter_type` /
+`reporter_id`; the `reporterFirstName` / `reporterLastName` / `reporterDob`
+GraphQL resolvers fall back to this block. Supplying a real `reporter_id`
+discards any hand-captured details.
+
+**Why they are not auto-registered as an `individual.Individual`:** the
+Individual registry is the system of record for programme participants —
+targeting, enrolment candidate lists, deduplication, payments, reporting
+headcounts. Auto-creating a row for every walk-in (including unverified or
+malicious callers) would:
+
+- pollute enrolment/targeting queries and headcount reports with non-participants;
+- generate duplicate rows — `IndividualService.create` does not deduplicate — that
+  then surface as noise in the deduplication review queue;
+- fan a grievance create out into another module's pipeline via
+  `individual_service.create` signals (deduplication, OpenSearch indexing, tasks),
+  so an individual-side failure could block grievance intake;
+- require grievance officers to hold individual-create rights and leave
+  location-less, unverified person records with no cleanup path if the grievance
+  is later rejected as spam.
+
+Keeping the details on the grievance avoids all of that while still making the
+complainant searchable and rendering them in the participant panel. If a walk-in
+later needs to be a real participant, that should be an explicit, human-reviewed
+"register this person" step — not a side effect of logging a grievance.
+
 ### Derived participant fields
 
 On create, `TicketService` denormalises the reporter's participant details into

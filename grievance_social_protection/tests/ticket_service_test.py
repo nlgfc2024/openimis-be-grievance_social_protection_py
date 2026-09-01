@@ -253,6 +253,44 @@ class TicketReporterDenormalizationTest(TestCase):
         ticket = Ticket.objects.get(uuid=result['data']['uuid'])
         self.assertEqual(ticket.json_ext or {}, {})
 
+    def test_unregistered_reporter_captured_into_json_ext(self):
+        result = self.service.create({
+            "category": "Default",
+            "title": "Walk-in complainant",
+            "channel": "Channel A",
+            "reporter_first_name": "Jane",
+            "reporter_last_name": "Phiri",
+            "reporter_dob": date(1990, 5, 1),
+            "reporter_phone": "0999000111",
+            "reporter_national_id": "NID-WALKIN-1",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertIsNone(ticket.reporter_type_id)
+        self.assertIsNone(ticket.reporter_id)
+        self.assertEqual(ticket.json_ext['unregistered_reporter'], {
+            'first_name': 'Jane', 'last_name': 'Phiri', 'dob': '1990-05-01',
+            'phone': '0999000111', 'national_id': 'NID-WALKIN-1',
+        })
+        # mirrored onto the keys the filter wizard / participant panel read
+        self.assertEqual(ticket.json_ext.get('national_id'), 'NID-WALKIN-1')
+        self.assertEqual(ticket.json_ext.get('household_mobile_number'), '0999000111')
+
+    def test_unregistered_reporter_ignored_when_reporter_id_present(self):
+        individual = create_test_individual(self.user)
+        result = self.service.create({
+            "category": "Default",
+            "title": "Registered wins",
+            "channel": "Channel A",
+            "reporter_type": "individual",
+            "reporter_id": str(individual.id),
+            "reporter_first_name": "Ignored",
+            "reporter_last_name": "Ignored",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertNotIn('unregistered_reporter', ticket.json_ext or {})
+
 
 class TicketWageAmountTest(TestCase):
     """wage_amount storage for partial-wages approval (maker-checker → arrears)."""

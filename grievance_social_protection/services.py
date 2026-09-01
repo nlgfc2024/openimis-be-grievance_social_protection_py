@@ -428,6 +428,7 @@ class TicketService(BaseService):
             raise ValidationError(wage_amount_error)
         self._apply_default_status(obj_data)
         self._apply_due_date(obj_data)
+        self._apply_unregistered_reporter(obj_data)
         self._denormalize_reporter_fields(obj_data)
         self._apply_derived_district(obj_data)
         self._apply_derived_micro_catchment(obj_data)
@@ -443,6 +444,7 @@ class TicketService(BaseService):
     @register_service_signal('ticket_service.update')
     def update(self, obj_data):
         self._get_content_type(obj_data)
+        self._apply_unregistered_reporter(obj_data)
         self._validate_existing_ticket_access(obj_data, access_type=GrievanceAccessControl.PERM_UPDATE)
         self._validate_access_control(obj_data, access_type=GrievanceAccessControl.PERM_UPDATE)
         self._apply_category_defaults(obj_data)
@@ -641,6 +643,46 @@ class TicketService(BaseService):
             # due_date is date-only; round a partial-day SLA up to the next day.
             due_date += timedelta(days=1)
         obj_data['due_date'] = due_date
+
+    # Mutation input keys for a hand-captured walk-in complainant, and the
+    # ticket.json_ext['unregistered_reporter'] keys they map to.
+    UNREGISTERED_REPORTER_INPUT_KEYS = {
+        'reporter_first_name': 'first_name',
+        'reporter_last_name': 'last_name',
+        'reporter_dob': 'dob',
+        'reporter_phone': 'phone',
+        'reporter_national_id': 'national_id',
+    }
+
+    def _apply_unregistered_reporter(self, obj_data):
+        """
+        A walk-in / unregistered complainant is captured by hand rather than registered as an Individual.
+        Their details are moved off the flat mutation input onto ``ticket.json_ext['unregistered_reporter']``
+        and the searchable ``national_id`` / ``household_mobile_number`` keys are mirrored alongside the ones ``_denormalize_reporter_fields`` writes.
+
+        Ignored (but still stripped from obj_data) when a real ``reporter_id``
+        is supplied.
+        """
+        captured = {}
+        for input_key, ext_key in self.UNREGISTERED_REPORTER_INPUT_KEYS.items():
+            value = obj_data.pop(input_key, None)
+            if value not in (None, ''):
+                captured[ext_key] = value
+
+        if not captured or obj_data.get('reporter_id'):
+            return
+
+        dob = captured.get('dob')
+        if hasattr(dob, 'isoformat'):
+            captured['dob'] = dob.isoformat()
+
+        json_ext = dict(obj_data.get('json_ext') or {})
+        json_ext['unregistered_reporter'] = captured
+        if captured.get('national_id'):
+            json_ext.setdefault('national_id', captured['national_id'])
+        if captured.get('phone'):
+            json_ext.setdefault('household_mobile_number', captured['phone'])
+        obj_data['json_ext'] = json_ext
 
     def _denormalize_reporter_fields(self, obj_data):
         """

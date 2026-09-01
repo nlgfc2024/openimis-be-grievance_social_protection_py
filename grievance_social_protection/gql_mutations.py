@@ -27,6 +27,13 @@ class CreateTicketInputType(OpenIMISMutation.Input):
     description = graphene.String(required=False)
     reporter_type = graphene.String(required=False, max_lenght=255)
     reporter_id = graphene.String(required=False, max_lenght=255)
+    # Walk-in / unregistered complainant captured by hand. Stored on
+    # ticket.json_ext['unregistered_reporter']; ignored when reporter_id is set.
+    reporter_first_name = graphene.String(required=False)
+    reporter_last_name = graphene.String(required=False)
+    reporter_dob = graphene.Date(required=False)
+    reporter_phone = graphene.String(required=False)
+    reporter_national_id = graphene.String(required=False)
     attending_staff_id = graphene.UUID(required=False)
     date_of_incident = graphene.Date(required=False)
     status = graphene.Field(TicketStatusEnum, required=False)
