@@ -191,6 +191,43 @@ class TicketDueDateAndStatusTest(TestCase):
         self.assertEqual(ticket.due_date, date.today())
         self.assertEqual(ticket.status, Ticket.TicketStatus.RESOLVED)
 
+    def test_resolution_filled_from_category_when_not_supplied(self):
+        result = self.service.create({
+            "category": "Claims",
+            "title": "SLA from category",
+            "channel": "Channel A",
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.resolution, '30,0')
+
+    def test_due_date_recomputed_on_category_change(self):
+        result = self.service.create({
+            "category": "no_sla_category",
+            "title": "Wrong type",
+            "channel": "Channel A",
+        })
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertIsNone(ticket.due_date)
+
+        self.service.update({"id": ticket.uuid, "category": "Claims"})
+        ticket.refresh_from_db()
+        self.assertEqual(ticket.due_date, ticket.date_created.date() + timedelta(days=30))
+        self.assertEqual(ticket.resolution, '30,0')
+
+    def test_due_date_not_touched_when_category_unchanged_on_update(self):
+        result = self.service.create({
+            "category": "Claims",
+            "title": "Stable timer",
+            "channel": "Channel A",
+        })
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        original_due = ticket.due_date
+
+        self.service.update({"id": ticket.uuid, "category": "Claims", "title": "Stable timer edited"})
+        ticket.refresh_from_db()
+        self.assertEqual(ticket.due_date, original_due)
+
 
 class TicketReporterDenormalizationTest(TestCase):
     """denormalise reporter jsonExt fields into ticket.json_ext at create."""
