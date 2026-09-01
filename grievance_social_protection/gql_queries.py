@@ -257,6 +257,11 @@ class TicketGQLType(DjangoObjectType):
         return not root.version == Ticket.objects.get(id=root.id).version
 
     @staticmethod
+    def _unregistered_reporter(root):
+        """Hand-captured walk-in complainant details, or {} (see TicketService)."""
+        return (root.json_ext or {}).get('unregistered_reporter') or {}
+
+    @staticmethod
     def resolve_reporter_first_name(root, info):
         check_ticket_perms(info)
         if TicketGQLType._should_restrict_field('reporter_first_name', root, info):
@@ -272,7 +277,7 @@ class TicketGQLType(DjangoObjectType):
                         return model_object.individual.first_name
                     elif root.reporter_type.name == 'user':
                         return None
-        return None
+        return TicketGQLType._unregistered_reporter(root).get('first_name')
 
     @staticmethod
     def resolve_reporter_last_name(root, info):
@@ -290,7 +295,7 @@ class TicketGQLType(DjangoObjectType):
                         return model_object.individual.last_name
                     elif root.reporter_type.name == 'user':
                         return None
-        return None
+        return TicketGQLType._unregistered_reporter(root).get('last_name')
 
     @staticmethod
     def resolve_reporter_dob(root, info):
@@ -308,7 +313,7 @@ class TicketGQLType(DjangoObjectType):
                         return model_object.individual.dob
                     elif root.reporter_type.name == 'user':
                         return None
-        return None
+        return TicketGQLType._unregistered_reporter(root).get('dob')
 
     @staticmethod
     def resolve_description(root, info):
