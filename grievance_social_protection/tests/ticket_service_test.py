@@ -1,3 +1,4 @@
+import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import patch
@@ -766,6 +767,160 @@ class TicketDerivedProjectFieldsTest(TestCase):
     def test_preview_reporter_derived_fields_unknown_reporter_returns_empty(self):
         self.assertEqual(self.service.preview_reporter_derived_fields('individual', '0' * 32), {})
         self.assertEqual(self.service.preview_reporter_derived_fields(None, None), {})
+
+
+class TicketReporterEnrolmentContextTest(TestCase):
+    """
+    Derived project fields must follow the Phase -> Project -> Household selected
+    at intake, not fall back to an unrelated first enrolment.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        setup_grievance_config(DEFAULT_CFG)
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.service = TicketService(cls.user)
+        cls.group_plan = BenefitPlan(
+            code=f'G{uuid.uuid4().hex[:7]}', name='PWP Group Plan',
+            type=BenefitPlan.BenefitPlanType.GROUP_TYPE)
+        cls.group_plan.save(user=cls.user)
+        cls.individual_plan = BenefitPlan(
+            code=f'I{uuid.uuid4().hex[:7]}', name='Cash Plan',
+            type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE)
+        cls.individual_plan.save(user=cls.user)
+        cls.activity = Activity(name='Enrolment Activity')
+        cls.activity.save(user=cls.user)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.individual_plan.delete()
+        cls.group_plan.delete()
+        super().tearDownClass()
+
+    def _project(self, name, *, hotspot_name=None):
+        tag = uuid.uuid4().hex[:6]
+        location = Location.objects.create(code=f'ENRV{tag}', name=f'{name} Village', type='V')
+        hotspot = None
+        if hotspot_name:
+            micro_catchment = MicroCatchment.objects.create(
+                code=f'ENRMC{tag}', name=f'{name} MC', audit_user_id=-1)
+            hotspot = Hotspot.objects.create(
+                code=f'ENRHS{tag}', name=hotspot_name, micro_catchment=micro_catchment)
+        project = Project(
+            benefit_plan=self.group_plan, name=f'{name} {tag}', activity=self.activity,
+            location=location, target_beneficiaries=10, working_days=30, hotspot=hotspot)
+        project.save(user=self.user)
+        return project
+
+    def _enrol_in_household(self, individual, project, *, worked_days=0, deleted_enrolment=False):
+        tag = uuid.uuid4().hex[:6]
+        group = Group(code=f'HH{tag}')
+        group.save(username=self.user.username)
+        GroupIndividual(individual_id=individual.id, group_id=group.id, role='HEAD') \
+            .save(username=self.user.username)
+        gb = GroupBeneficiary(
+            group=group, benefit_plan=project.benefit_plan, status=BeneficiaryStatus.ACTIVE)
+        gb.save(user=self.user)
+        enr = GroupBeneficiaryProjectEnrollment(group_beneficiary=gb, project=project)
+        enr.save(user=self.user)
+        for day in range(1, worked_days + 1):
+            GroupBeneficiaryProjectTimeEntry(
+                enrollment=enr, day_number=day, percent_complete=100).save(user=self.user)
+        if deleted_enrolment:
+            enr.delete(user=self.user)
+        return gb, enr
+
+    def _create_with_context(self, individual, *, project=None, group_beneficiary=None):
+        payload = {
+            "category": "Default", "title": "context", "channel": "Channel A",
+            "reporter_type": "individual", "reporter_id": str(individual.id),
+        }
+        if project is not None:
+            payload["reporter_project_id"] = str(project.id)
+        if group_beneficiary is not None:
+            payload["reporter_group_beneficiary_id"] = str(group_beneficiary.id)
+        result = self.service.create(payload)
+        self.assertTrue(result.get('success', False), result.get('detail', "No details provided"))
+        return Ticket.objects.get(uuid=result['data']['uuid']).json_ext or {}
+
+    def test_selected_project_wins_over_unrelated_first_membership(self):
+        individual = create_test_individual(self.user)
+        project_a = self._project('Project A', hotspot_name='Hotspot A')
+        project_b = self._project('Project B', hotspot_name='Hotspot B')
+        gb_a, _ = self._enrol_in_household(individual, project_a, worked_days=5)
+        self._enrol_in_household(individual, project_b, worked_days=9)
+
+        ext_a = self._create_with_context(individual, project=project_a, group_beneficiary=gb_a)
+        self.assertEqual(ext_a.get('hotspot_name'), 'Hotspot A')
+        self.assertEqual(ext_a.get('days_worked'), 5)
+
+        ext_b = self._create_with_context(individual, project=project_b)
+        self.assertEqual(ext_b.get('hotspot_name'), 'Hotspot B')
+        self.assertEqual(ext_b.get('days_worked'), 9)
+
+    def test_direct_beneficiary_does_not_shadow_selected_group_project(self):
+        individual = create_test_individual(self.user)
+        # a direct INDIVIDUAL-plan beneficiary that the old "beneficiary_set.first()"
+        # path would have latched onto
+        Beneficiary(
+            individual=individual, benefit_plan=self.individual_plan,
+            status=BeneficiaryStatus.ACTIVE).save(user=self.user)
+        project = self._project('Group Project', hotspot_name='Group Hotspot')
+        gb, _ = self._enrol_in_household(individual, project, worked_days=4)
+
+        ext = self._create_with_context(individual, project=project, group_beneficiary=gb)
+        self.assertEqual(ext.get('project_name'), 'PWP Group Plan')
+        self.assertEqual(ext.get('hotspot_name'), 'Group Hotspot')
+        self.assertEqual(ext.get('days_worked'), 4)
+
+    def test_reporter_not_in_selected_project_derives_nothing(self):
+        individual = create_test_individual(self.user)
+        enrolled_project = self._project('Enrolled', hotspot_name='Enrolled Hotspot')
+        self._enrol_in_household(individual, enrolled_project, worked_days=3)
+        other_project = self._project('Other', hotspot_name='Other Hotspot')
+
+        ext = self._create_with_context(individual, project=other_project)
+        self.assertNotIn('project_name', ext)
+        self.assertNotIn('hotspot_name', ext)
+        self.assertNotIn('days_worked', ext)
+
+    def test_deleted_enrolment_is_ignored(self):
+        individual = create_test_individual(self.user)
+        project = self._project('Deleted Enr', hotspot_name='DE Hotspot')
+        self._enrol_in_household(individual, project, worked_days=7, deleted_enrolment=True)
+
+        ext = self._create_with_context(individual, project=project)
+        self.assertNotIn('days_worked', ext)
+        self.assertNotIn('hotspot_name', ext)
+
+    def test_deleted_direct_beneficiary_excluded_from_fallback(self):
+        individual = create_test_individual(self.user)
+        beneficiary = Beneficiary(
+            individual=individual, benefit_plan=self.individual_plan,
+            status=BeneficiaryStatus.ACTIVE)
+        beneficiary.save(user=self.user)
+        beneficiary.delete(user=self.user)
+        project = self._project('Live Group', hotspot_name='LG Hotspot')
+        self._enrol_in_household(individual, project, worked_days=2)
+
+        # no context -> the deleted beneficiary must not win; the live group
+        # enrolment is used instead
+        ext = self._create_with_context(individual)
+        self.assertEqual(ext.get('project_name'), 'PWP Group Plan')
+        self.assertEqual(ext.get('days_worked'), 2)
+
+    def test_preview_honours_project_context(self):
+        individual = create_test_individual(self.user)
+        project_a = self._project('Prev A', hotspot_name='Prev Hotspot A')
+        project_b = self._project('Prev B', hotspot_name='Prev Hotspot B')
+        self._enrol_in_household(individual, project_a, worked_days=6)
+        self._enrol_in_household(individual, project_b, worked_days=1)
+
+        preview = self.service.preview_reporter_derived_fields(
+            'individual', str(individual.id), str(project_b.id))
+        self.assertEqual(preview.get('hotspot_name'), 'Prev Hotspot B')
+        self.assertEqual(preview.get('days_worked'), 1)
 
 
 class TicketAutoAssignmentTest(TestCase):
