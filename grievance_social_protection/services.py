@@ -106,103 +106,102 @@ def _resolve_micro_catchment(gvh_code, ta_code):
     return None
 
 
-def _resolve_reporter_beneficiary(reporter_type, reporter_id):
+def _count_enrollment_days_worked(enrollment):
+    """Worked-day count (percent_complete > 0) for one project enrolment."""
+    return enrollment.time_entries.filter(is_deleted=False, percent_complete__gt=0).count()
+
+
+def _resolve_reporter_enrolment(reporter_type, reporter_id, *, project_id=None, group_beneficiary_id=None):
     """
-    Resolve the reporter to the social-protection enrolment record its derived
-    project fields hang off — at most one of the two returned handles is set:
+    Resolve the reporter to their project enrolment, honouring the intake
+    selection when it is passed:
 
-      (individual_beneficiary, None)  — INDIVIDUAL benefit plans
-      (None, group_beneficiary)       — GROUP benefit plans (the reporter is a
-                                        household member; enrolment is at the
-                                        household / GroupBeneficiary level)
+      * ``project_id`` / ``group_beneficiary_id`` pin the exact enrolment, and
+        the reporter must actually belong to it (the individual behind the
+        Beneficiary, or a non-deleted member of the household) — a mismatch
+        yields ``(None, None)`` so no unrelated project / hotspot / days-worked
+        is derived;
+      * without them, fall back to the reporter's first non-deleted enrolment,
+        then to a bare Beneficiary / GroupBeneficiary for the plan name only.
 
-    A ``beneficiary`` reporter *is* an individual Beneficiary. An ``individual``
-    reporter resolves to their first individual Beneficiary, or failing that to
-    the first GroupBeneficiary of a group they belong to. ``user`` reporters and
-    unenrolled individuals resolve to ``(None, None)``.
+    Deleted beneficiary, group-beneficiary, membership and enrolment rows are
+    excluded throughout.
+
+    Returns ``(holder, enrollment)``:
+      holder      social_protection.Beneficiary | GroupBeneficiary | None
+      enrollment  project_social_protection.*ProjectEnrollment | None
     """
     model_object = reporter_type.get_object_for_this_type(pk=reporter_id)
     if not model_object:
         return None, None
 
+    ben_enrolment_model = apps.get_model('project_social_protection', 'BeneficiaryProjectEnrollment')
+    grp_enrolment_model = apps.get_model('project_social_protection', 'GroupBeneficiaryProjectEnrollment')
+    beneficiary_model = apps.get_model('social_protection', 'Beneficiary')
+    group_beneficiary_model = apps.get_model('social_protection', 'GroupBeneficiary')
+    pinned = bool(project_id or group_beneficiary_id)
+
     if reporter_type.name == 'beneficiary':
-        return model_object, None
+        beneficiary = model_object
+        qs = ben_enrolment_model.objects.filter(
+            beneficiary_id=beneficiary.id, is_deleted=False,
+        ).select_related('project', 'project__hotspot')
+        if project_id:
+            qs = qs.filter(project_id=project_id)
+        enrollment = qs.first()
+        if enrollment or not pinned:
+            return beneficiary, enrollment
+        return None, None
 
-    if reporter_type.name == 'individual':
-        beneficiary = model_object.beneficiary_set.select_related('benefit_plan').first()
-        if beneficiary:
-            return beneficiary, None
+    if reporter_type.name != 'individual':
+        return None, None
 
-        group_beneficiary_model = apps.get_model('social_protection', 'GroupBeneficiary')
-        group_ids = model_object.groupindividuals.filter(
-            is_deleted=False
-        ).values_list('group_id', flat=True)
-        group_beneficiary = group_beneficiary_model.objects.filter(
-            group_id__in=group_ids, is_deleted=False
-        ).select_related('benefit_plan').first()
-        return None, group_beneficiary
+    individual = model_object
 
-    return None, None
+    # 1. individual Beneficiary -> project enrolment (INDIVIDUAL benefit plans)
+    ben_qs = ben_enrolment_model.objects.filter(
+        is_deleted=False,
+        beneficiary__is_deleted=False,
+        beneficiary__individual_id=individual.id,
+    ).select_related('beneficiary__benefit_plan', 'project', 'project__hotspot')
+    if project_id:
+        ben_qs = ben_qs.filter(project_id=project_id)
+    enrollment = ben_qs.first()
+    if enrollment:
+        return enrollment.beneficiary, enrollment
 
+    # 2. household GroupBeneficiary -> project enrolment (GROUP / PWP plans)
+    grp_qs = grp_enrolment_model.objects.filter(
+        is_deleted=False,
+        group_beneficiary__is_deleted=False,
+        group_beneficiary__group__groupindividuals__individual_id=individual.id,
+        group_beneficiary__group__groupindividuals__is_deleted=False,
+    ).select_related('group_beneficiary__benefit_plan', 'project', 'project__hotspot').distinct()
+    if group_beneficiary_id:
+        grp_qs = grp_qs.filter(group_beneficiary_id=group_beneficiary_id)
+    if project_id:
+        grp_qs = grp_qs.filter(project_id=project_id)
+    enrollment = grp_qs.first()
+    if enrollment:
+        return enrollment.group_beneficiary, enrollment
 
-def _resolve_project_name(reporter_type, reporter_id):
-    """
-    Resolve the participant's project (benefit plan) name. Individual and group
-    reporters both fall back through _resolve_reporter_beneficiary (an individual
-    may belong to more than one plan — first is a reasonable default pending
-    product guidance).
-    """
-    beneficiary, group_beneficiary = _resolve_reporter_beneficiary(reporter_type, reporter_id)
-    enrolment = beneficiary or group_beneficiary
-    return enrolment.benefit_plan.name if enrolment else None
+    if pinned:
+        # a project/household was selected but the reporter isn't enrolled in it
+        return None, None
 
-
-def _resolve_days_worked(reporter_type, reporter_id):
-    """
-    Resolve total days worked as the count of project time-entry rows with
-    percent_complete > 0 across the participant's project enrolments
-    (project_social_protection *ProjectTimeEntry — a cash-for-work program's
-    daily muster roll). INDIVIDUAL-plan reporters count their individual
-    Beneficiary's entries; GROUP-plan reporters (household members) count their
-    household's GroupBeneficiary entries.
-    """
-    beneficiary, group_beneficiary = _resolve_reporter_beneficiary(reporter_type, reporter_id)
-
+    # 3. no enrolment anywhere — a bare Beneficiary / GroupBeneficiary is still
+    #    enough for the benefit-plan name
+    beneficiary = beneficiary_model.objects.filter(
+        individual_id=individual.id, is_deleted=False,
+    ).select_related('benefit_plan').first()
     if beneficiary:
-        time_entry_model = apps.get_model('project_social_protection', 'BeneficiaryProjectTimeEntry')
-        return time_entry_model.objects.filter(
-            enrollment__beneficiary_id=beneficiary.id,
-            enrollment__is_deleted=False,
-            is_deleted=False,
-            percent_complete__gt=0,
-        ).count()
+        return beneficiary, None
 
-    if group_beneficiary:
-        time_entry_model = apps.get_model('project_social_protection', 'GroupBeneficiaryProjectTimeEntry')
-        return time_entry_model.objects.filter(
-            enrollment__group_beneficiary_id=group_beneficiary.id,
-            enrollment__is_deleted=False,
-            is_deleted=False,
-            percent_complete__gt=0,
-        ).count()
-
-    return None
-
-
-def _resolve_reporter_project(reporter_type, reporter_id):
-    """
-    The first (individual or group) project the reporter is enrolled in, or
-    None. Used for project-derived fields that need the Project itself (e.g.
-    its hotspot) rather than just the benefit plan.
-    """
-    beneficiary, group_beneficiary = _resolve_reporter_beneficiary(reporter_type, reporter_id)
-    enrolment_holder = beneficiary or group_beneficiary
-    if not enrolment_holder:
-        return None
-    enrollment = enrolment_holder.project_enrollments.filter(
-        is_deleted=False
-    ).select_related('project', 'project__hotspot').first()
-    return enrollment.project if enrollment else None
+    group_ids = individual.groupindividuals.filter(is_deleted=False).values_list('group_id', flat=True)
+    group_beneficiary = group_beneficiary_model.objects.filter(
+        group_id__in=group_ids, is_deleted=False,
+    ).select_related('benefit_plan').first()
+    return group_beneficiary, None
 
 
 class AssignmentService:
@@ -459,6 +458,9 @@ class TicketService(BaseService):
 
     @register_service_signal('ticket_service.update')
     def update(self, obj_data):
+        # Reporter enrolment context is a create-time hint only.
+        for key in self.REPORTER_ENROLMENT_CONTEXT_KEYS:
+            obj_data.pop(key, None)
         self._get_content_type(obj_data)
         self._apply_unregistered_reporter(obj_data)
         self._validate_existing_ticket_access(obj_data, access_type=GrievanceAccessControl.PERM_UPDATE)
@@ -807,44 +809,70 @@ class TicketService(BaseService):
             json_ext['micro_catchment'] = micro_catchment_name
             obj_data['json_ext'] = json_ext
 
+    # Intake-selection keys threaded alongside the reporter (mutation input /
+    # preview args); consumed and stripped here, never written to the model.
+    REPORTER_ENROLMENT_CONTEXT_KEYS = ('reporter_project_id', 'reporter_group_beneficiary_id')
+
     def _apply_derived_project_fields(self, obj_data):
         """
-        Derive project_name, days_worked and hotspot_name from the reporter's
-        benefit plan / project enrollments. No reporter, or nothing found,
-        leaves the ticket without these fields — no error.
+        Derive project_name, days_worked and hotspot_name from the exact project
+        enrolment the intake form pointed at (`reporter_project_id` /
+        `reporter_group_beneficiary_id`), falling back to the reporter's first
+        enrolment when none was selected. No reporter, or a reporter that does
+        not belong to the selected project/household, leaves these fields unset
+        — no error.
         """
+        project_id = obj_data.pop('reporter_project_id', None)
+        group_beneficiary_id = obj_data.pop('reporter_group_beneficiary_id', None)
+
         reporter_type = obj_data.get('reporter_type')
         reporter_id = obj_data.get('reporter_id')
         if not reporter_type or not reporter_id:
             return
 
+        try:
+            holder, enrollment = _resolve_reporter_enrolment(
+                reporter_type, reporter_id,
+                project_id=project_id, group_beneficiary_id=group_beneficiary_id,
+            )
+        except (ValueError, ValidationError, ObjectDoesNotExist):
+            # a malformed id hint must not block ticket creation
+            return
+        if holder is None and enrollment is None:
+            return
+
         json_ext = dict(obj_data.get('json_ext') or {})
+        if holder is not None:
+            json_ext['project_name'] = holder.benefit_plan.name
 
-        project_name = _resolve_project_name(reporter_type, reporter_id)
-        if project_name:
-            json_ext['project_name'] = project_name
+        if enrollment is not None:
+            json_ext['days_worked'] = _count_enrollment_days_worked(enrollment)
+            if enrollment.project and enrollment.project.hotspot_id:
+                json_ext['hotspot_name'] = enrollment.project.hotspot.name
+        elif holder is not None and not (project_id or group_beneficiary_id):
+            # a registered beneficiary with no project enrolment yet — record 0
+            # so the field is present (matches the pre-project behaviour)
+            json_ext['days_worked'] = 0
 
-        days_worked = _resolve_days_worked(reporter_type, reporter_id)
-        if days_worked is not None:
-            json_ext['days_worked'] = days_worked
+        obj_data['json_ext'] = json_ext
 
-        project = _resolve_reporter_project(reporter_type, reporter_id)
-        if project is not None and project.hotspot_id:
-            json_ext['hotspot_name'] = project.hotspot.name
-
-        if json_ext:
-            obj_data['json_ext'] = json_ext
-
-    def preview_reporter_derived_fields(self, reporter_type_name, reporter_id):
+    def preview_reporter_derived_fields(
+        self, reporter_type_name, reporter_id, project_id=None, group_beneficiary_id=None,
+    ):
         """
-        The participant ``json_ext`` a ticket WOULD receive for this reporter,
-        computed without persisting anything — lets the intake form show
-        district / micro-catchment / project / hotspot before the grievance is
-        saved. Runs the same pipeline as ``create``.
+        The participant ``json_ext`` a ticket WOULD receive for this reporter and
+        the selected project/household, computed without persisting anything —
+        lets the intake form show district / micro-catchment / project / hotspot
+        before the grievance is saved. Runs the same pipeline as ``create``.
         """
         if not reporter_type_name or not reporter_id:
             return {}
-        obj_data = {'reporter_type': reporter_type_name, 'reporter_id': str(reporter_id)}
+        obj_data = {
+            'reporter_type': reporter_type_name,
+            'reporter_id': str(reporter_id),
+            'reporter_project_id': project_id or None,
+            'reporter_group_beneficiary_id': group_beneficiary_id or None,
+        }
         try:
             self._get_content_type(obj_data)
             self._denormalize_reporter_fields(obj_data)
