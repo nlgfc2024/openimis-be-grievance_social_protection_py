@@ -349,6 +349,11 @@ class ConfigProcessingTest(TestCase):
                     'search_result_columns', 'enable_export'):
             self.assertIn(key, DEFAULT_CFG)
 
+    def test_default_search_result_columns_include_ticket_code(self):
+        self.assertIn(
+            {"key": "code", "label": "Ticket Code"}, DEFAULT_CFG['search_result_columns']
+        )
+
     def test_default_cfg_passes_validators(self):
         """An empty override merges onto DEFAULT_CFG — it must validate cleanly."""
         cfg = copy.deepcopy(DEFAULT_CFG)
