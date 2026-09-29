@@ -7,10 +7,10 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied, ObjectDoesNotExist
 from django.core.mail import send_mail, BadHeaderError
-from django.db.models import Max
 from django.db import transaction
 from django.template import loader
 
+from core.code_generation import generate_unique_year_code
 from core.services import BaseService
 from core.signals import register_service_signal
 from core.services.utils import check_authentication as check_authentication, output_exception, \
@@ -561,14 +561,9 @@ class TicketService(BaseService):
 
     def _generate_code(self, obj_data):
         if not obj_data.get('code'):
-            last_ticket_code = Ticket.objects.filter(code__startswith='GRS').aggregate(Max('code')).get('code__max')
-            if last_ticket_code is None:
-                last_ticket_code_numeric = 0
-            else:
-                last_ticket_code_numeric = int(last_ticket_code[3:])
-
-            new_ticket_code = f'GRS{last_ticket_code_numeric + 1:08}'
-            obj_data['code'] = new_ticket_code
+            obj_data['code'] = generate_unique_year_code(
+                Ticket, {}, prefix='GRS'
+            )
 
     def _validate_access_control(self, obj_data, access_type=GrievanceAccessControl.PERM_CREATE):
         """Validate user has permission to use selected category and flags"""

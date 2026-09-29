@@ -69,8 +69,9 @@ DEFAULT_CFG = {
     "participant_fields": [],
     "search_filters": ["formNumber", "location", "nationalId", "status", "priority", "dateRange"],
     "search_result_columns": [
+        {"key": "code", "label": "Ticket Code"},
         {"key": "formNumber", "label": "HH Form Number"},
-        {"key": "location", "label": "Location"},
+        {"key": "location", "label": "Village Name"},
         {"key": "status", "label": "Status"},
         {"key": "priority", "label": "Priority"},
         {"key": "attendingStaff", "label": "Officer Assigned"},

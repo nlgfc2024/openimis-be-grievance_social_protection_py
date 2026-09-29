@@ -62,6 +62,15 @@ class TicketServiceTest(TestCase):
         query = self.query_all.filter(uuid=uuid)
         self.assertEqual(query.count(), 1)
 
+    @patch('grievance_social_protection.services.generate_unique_year_code', return_value='GRS202612345')
+    def test_add_ticket_generates_a_core_code(self, generate_code):
+        payload = {}
+
+        self.service._generate_code(payload)
+
+        self.assertEqual(payload['code'], 'GRS202612345')
+        generate_code.assert_called_once_with(Ticket, {}, prefix='GRS')
+
     def test_add_ticket_validation(self):
         with self.assertRaises(ValidationError) as context:
             self.service.create(service_add_ticket_payload_bad_resolution)
