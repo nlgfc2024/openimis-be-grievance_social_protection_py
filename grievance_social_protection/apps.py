@@ -21,6 +21,8 @@ CATEGORY_SEPARATOR = ' > '
 VALID_ASSIGNMENT_STRATEGIES = frozenset({'random', 'round_robin', 'least_loaded'})
 VALID_ASSIGNMENT_SCOPES = frozenset({'district', 'national'})
 VALID_VIEW_SCOPE_DEFAULTS = frozenset({'all_cases', 'district_scoped', 'creator_scoped', 'none'})
+VALID_GEOGRAPHY_LEVELS = ('district', 'ta')
+VALID_PROJECT_LOCATION_LEVELS = ('district', 'ta', 'micro_catchment', 'hotspot')
 ALLOWED_WORKFLOW_APPROVED_SIGNALS = frozenset({'payroll.benefit_consumption.create'})
 ALLOWED_WORKFLOW_RESOLVE_TASKS = frozenset({'tasks_management'})
 
@@ -67,6 +69,23 @@ DEFAULT_CFG = {
     },
     "notifications": {"on_assign": True, "include_due_date": True, "channels": ["email"]},
     "participant_fields": [],
+    "geography_filters": {
+        "enabled": False,
+        "intake_enabled": False,
+        "case_search_enabled": False,
+        "levels": [
+            {"key": "district", "required": True},
+            {"key": "ta", "required": False},
+        ],
+        "project_location": {
+            "levels": [
+                {"key": "district", "required": True},
+                {"key": "micro_catchment", "required": True},
+                {"key": "hotspot", "required": True},
+            ],
+        },
+        "filter_projects": True,
+    },
     "search_filters": ["formNumber", "location", "nationalId", "status", "priority", "dateRange"],
     "search_result_columns": [
         {"key": "code", "label": "Ticket Code"},
@@ -110,6 +129,7 @@ class TicketConfig(AppConfig):
     sla = {}
     notifications = {}
     participant_fields = []
+    geography_filters = {}
     search_filters = []
     search_result_columns = []
     enable_export = False
@@ -192,6 +212,7 @@ class TicketConfig(AppConfig):
         self.__validate_attending_staff_roles(cfg)
         self.__validate_view_scope(cfg)
         self.__validate_category_workflows(cfg)
+        self.__validate_geography_filters(cfg)
 
     def _merge_with_defaults(self, instance):
         return {**copy.deepcopy(DEFAULT_CFG), **instance._cfg}
@@ -421,6 +442,105 @@ class TicketConfig(AppConfig):
             raise ValidationError(
                 f"view_scope['default'] '{default}' is invalid. "
                 f"Allowed: {sorted(VALID_VIEW_SCOPE_DEFAULTS)}."
+            )
+
+    @classmethod
+    def __validate_geography_filters(cls, cfg):
+        geography = cfg.get('geography_filters', {})
+        if not isinstance(geography, dict):
+            raise ValidationError("'geography_filters' must be a dict.")
+
+        for key in ('enabled', 'intake_enabled', 'case_search_enabled', 'filter_projects'):
+            if key in geography and not isinstance(geography[key], bool):
+                raise ValidationError(f"geography_filters['{key}'] must be a boolean.")
+
+        levels = geography.get('levels', [])
+        if not isinstance(levels, list):
+            raise ValidationError("geography_filters['levels'] must be a list.")
+
+        configured_keys = []
+        for level in levels:
+            if not isinstance(level, dict) or not level.get('key'):
+                raise ValidationError(
+                    "Each geography_filters level must be a dict with a 'key'."
+                )
+            level_key = level['key']
+            if level_key not in VALID_GEOGRAPHY_LEVELS:
+                raise ValidationError(
+                    f"Unsupported geography level '{level_key}'. "
+                    f"Allowed: {list(VALID_GEOGRAPHY_LEVELS)}."
+                )
+            if level_key in configured_keys:
+                raise ValidationError(f"Duplicate geography level '{level_key}'.")
+            if 'required' in level and not isinstance(level['required'], bool):
+                raise ValidationError(
+                    f"geography_filters level '{level_key}' required must be a boolean."
+                )
+            configured_keys.append(level_key)
+
+        expected_order = [key for key in VALID_GEOGRAPHY_LEVELS if key in configured_keys]
+        if configured_keys != expected_order:
+            raise ValidationError(
+                "geography_filters levels must follow district, ta order."
+            )
+
+        cls.__validate_geography_section(
+            geography,
+            'project_location',
+            VALID_PROJECT_LOCATION_LEVELS,
+        )
+        project_keys = cls.__section_level_keys(geography, 'project_location')
+        if 'hotspot' in project_keys and 'micro_catchment' not in project_keys:
+            raise ValidationError(
+                "project_location requires micro_catchment before hotspot."
+            )
+
+    @staticmethod
+    def __section_level_keys(geography, section_key):
+        section = geography.get(section_key)
+        if not isinstance(section, dict):
+            return []
+        return [level.get('key') for level in section.get('levels', [])]
+
+    @classmethod
+    def __validate_geography_section(cls, geography, section_key, allowed_levels):
+        section = geography.get(section_key)
+        if section is None:
+            return
+        if not isinstance(section, dict):
+            raise ValidationError(
+                f"geography_filters['{section_key}'] must be a dict."
+            )
+        levels = section.get('levels', [])
+        if not isinstance(levels, list):
+            raise ValidationError(
+                f"geography_filters['{section_key}']['levels'] must be a list."
+            )
+        configured_keys = []
+        for level in levels:
+            if not isinstance(level, dict) or not level.get('key'):
+                raise ValidationError(
+                    f"Each {section_key} level must be a dict with a 'key'."
+                )
+            level_key = level['key']
+            if level_key not in allowed_levels:
+                raise ValidationError(
+                    f"Unsupported {section_key} level '{level_key}'. "
+                    f"Allowed: {list(allowed_levels)}."
+                )
+            if level_key in configured_keys:
+                raise ValidationError(
+                    f"Duplicate {section_key} level '{level_key}'."
+                )
+            if 'required' in level and not isinstance(level['required'], bool):
+                raise ValidationError(
+                    f"{section_key} level '{level_key}' required must be a boolean."
+                )
+            configured_keys.append(level_key)
+        expected_order = [key for key in allowed_levels if key in configured_keys]
+        if configured_keys != expected_order:
+            raise ValidationError(
+                f"{section_key} levels must follow {', '.join(allowed_levels)} order."
             )
 
     @classmethod

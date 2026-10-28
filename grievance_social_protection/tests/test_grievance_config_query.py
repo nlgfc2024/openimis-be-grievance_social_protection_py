@@ -16,6 +16,7 @@ class GrievanceConfigQueryTest(TestCase):
     ATTRS = (
         'ticket_statuses', 'referral_entities', 'participant_fields',
         'search_filters', 'search_result_columns', 'sla', 'enable_export',
+        'geography_filters',
         'default_attending_staff_role_ids', 'processed_categories',
     )
 
@@ -57,6 +58,16 @@ class GrievanceConfigQueryTest(TestCase):
     def test_resolve_search_filters(self):
         TicketConfig.search_filters = ['formNumber', 'status']
         self.assertEqual(self.config_type.resolve_search_filters(None), ['formNumber', 'status'])
+
+    def test_resolve_geography_filters(self):
+        TicketConfig.geography_filters = {
+            'enabled': True,
+            'levels': [{'key': 'district', 'required': True}],
+        }
+        self.assertEqual(
+            self.config_type.resolve_geography_filters(None),
+            TicketConfig.geography_filters,
+        )
 
     def test_resolve_search_result_columns(self):
         TicketConfig.search_result_columns = [{'key': 'status', 'label': 'Status'}]

@@ -36,6 +36,69 @@ class ConfigProcessingTest(TestCase):
         self.assertEqual(processed['complaint']['permissions'], [])
         self.assertEqual(processed['complaint']['parent'], None)
 
+    def test_geography_filters_accept_ordered_location_hierarchy(self):
+        cfg = copy.deepcopy(DEFAULT_CFG)
+        cfg['geography_filters'] = {
+            'enabled': True,
+            'intake_enabled': True,
+            'case_search_enabled': True,
+            'levels': [
+                {'key': 'district', 'required': True},
+                {'key': 'ta', 'required': False},
+            ],
+            'filter_projects': True,
+        }
+
+        TicketConfig._TicketConfig__validate_geography_filters(cfg)
+
+    def test_geography_filters_reject_out_of_order_levels(self):
+        cfg = {
+            'geography_filters': {
+                'enabled': True,
+                'levels': [
+                    {'key': 'ta', 'required': False},
+                    {'key': 'district', 'required': True},
+                ],
+            },
+        }
+
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_geography_filters(cfg)
+
+    def test_geography_filters_reject_unknown_level(self):
+        cfg = {
+            'geography_filters': {
+                'enabled': True,
+                'levels': [{'key': 'region', 'required': True}],
+            },
+        }
+
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_geography_filters(cfg)
+
+    def test_geography_filters_accept_project_location_section(self):
+        cfg = copy.deepcopy(DEFAULT_CFG)
+        cfg['geography_filters']['project_location'] = {
+            'levels': [
+                {'key': 'district', 'required': True},
+                {'key': 'micro_catchment', 'required': True},
+                {'key': 'hotspot', 'required': True},
+            ],
+        }
+        TicketConfig._TicketConfig__validate_geography_filters(cfg)
+
+    def test_project_location_rejects_hotspot_without_micro_catchment(self):
+        cfg = copy.deepcopy(DEFAULT_CFG)
+        cfg['geography_filters']['project_location'] = {
+            'levels': [
+                {'key': 'district', 'required': True},
+                {'key': 'hotspot', 'required': True},
+            ],
+        }
+
+        with self.assertRaises(ValidationError):
+            TicketConfig._TicketConfig__validate_geography_filters(cfg)
+
     def test_process_mixed_categories(self):
         """Test processing mixed string and dict categories"""
         cfg = {
