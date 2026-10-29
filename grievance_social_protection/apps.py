@@ -447,11 +447,11 @@ class TicketConfig(AppConfig):
 
     @classmethod
     def __validate_location_filters(cls, cfg):
-        location_filters = cfg.get('location_filters', {})
+        location_filters = cfg.get('location_filters')
         if not isinstance(location_filters, dict):
             raise ValidationError("'location_filters' must be a dict.")
 
-        enabled = location_filters.get('enabled', False)
+        enabled = location_filters.get('enabled')
         if not isinstance(enabled, bool):
             raise ValidationError("location_filters['enabled'] must be a boolean.")
 

@@ -159,10 +159,16 @@ class ConfigProcessingTest(TestCase):
         self._validate_location_filters(enabled=False)
 
     def test_location_filters_reject_nonboolean_enabled(self):
-        with self.assertRaisesRegex(ValidationError, 'enabled.*must be a boolean'):
-            TicketConfig._TicketConfig__validate_location_filters({
-                'location_filters': {'enabled': 1},
-            })
+        invalid_configs = (
+            {},
+            {'location_filters': None},
+            {'location_filters': []},
+            {'location_filters': {}},
+            {'location_filters': {'enabled': 1}},
+        )
+        for cfg in invalid_configs:
+            with self.subTest(cfg=cfg), self.assertRaises(ValidationError):
+                TicketConfig._TicketConfig__validate_location_filters(cfg)
 
     def test_location_filters_partial_override_does_not_inherit_default_levels(self):
         app_config = TicketConfig(
@@ -174,6 +180,23 @@ class ConfigProcessingTest(TestCase):
         self.assertEqual(merged['location_filters'], {'enabled': True})
         with self.assertRaisesRegex(
             ValidationError, 'must be a nonempty list when enabled'
+        ):
+            app_config._validate_module_config(override)
+
+    def test_location_filters_partial_override_requires_enabled(self):
+        app_config = TicketConfig(
+            'grievance_social_protection', grievance_social_protection
+        )
+        override = SimpleNamespace(_cfg={
+            'location_filters': {
+                'levels': [{'key': 'district', 'required': True}],
+            },
+        })
+
+        merged = app_config._merge_with_defaults(override)
+        self.assertNotIn('enabled', merged['location_filters'])
+        with self.assertRaisesRegex(
+            ValidationError, 'enabled.*must be a boolean'
         ):
             app_config._validate_module_config(override)
 
