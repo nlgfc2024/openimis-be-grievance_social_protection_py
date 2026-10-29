@@ -5,6 +5,9 @@ the grievance_category_staff_roles fix: default_attending_staff_role_ids
 values can now be a plain role-id list (legacy) or a {role_ids, strategy, scope} dict, 
 and the resolver must handle both.
 """
+import json
+
+import graphene
 from django.test import TestCase
 
 from grievance_social_protection.apps import TicketConfig
@@ -16,7 +19,7 @@ class GrievanceConfigQueryTest(TestCase):
     ATTRS = (
         'ticket_statuses', 'referral_entities', 'participant_fields',
         'search_filters', 'search_result_columns', 'sla', 'enable_export',
-        'geography_filters',
+        'location_filters',
         'default_attending_staff_role_ids', 'processed_categories',
     )
 
@@ -59,14 +62,35 @@ class GrievanceConfigQueryTest(TestCase):
         TicketConfig.search_filters = ['formNumber', 'status']
         self.assertEqual(self.config_type.resolve_search_filters(None), ['formNumber', 'status'])
 
-    def test_resolve_geography_filters(self):
-        TicketConfig.geography_filters = {
+    def test_resolve_location_filters(self):
+        TicketConfig.location_filters = {
             'enabled': True,
             'levels': [{'key': 'district', 'required': True}],
         }
         self.assertEqual(
-            self.config_type.resolve_geography_filters(None),
-            TicketConfig.geography_filters,
+            self.config_type.resolve_location_filters(None),
+            TicketConfig.location_filters,
+        )
+
+    def test_location_filters_graphql_field_and_json_serialization(self):
+        class Query(graphene.ObjectType):
+            config = graphene.Field(GrievanceTypeConfigurationGQLType)
+
+            def resolve_config(self, info):
+                return GrievanceTypeConfigurationGQLType()
+
+        TicketConfig.location_filters = {
+            'enabled': True,
+            'levels': [{'key': 'district', 'required': True}],
+        }
+        result = graphene.Schema(query=Query).execute(
+            '{ config { locationFilters } }'
+        )
+
+        self.assertIsNone(result.errors)
+        self.assertEqual(
+            json.loads(result.data['config']['locationFilters']),
+            TicketConfig.location_filters,
         )
 
     def test_resolve_search_result_columns(self):
