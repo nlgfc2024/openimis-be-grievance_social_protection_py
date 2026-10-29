@@ -560,7 +560,7 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
     ticket_statuses = graphene.List(TicketStatusGQLType)
     referral_entities = graphene.List(graphene.String)
     participant_fields = graphene.List(ParticipantFieldGQLType)
-    geography_filters = graphene.JSONString()
+    location_filters = graphene.JSONString()
     search_filters = graphene.List(graphene.String)
     search_result_columns = graphene.List(SearchResultColumnGQLType)
     sla = graphene.JSONString()
@@ -681,8 +681,8 @@ class GrievanceTypeConfigurationGQLType(ObjectType):
             if isinstance(field, dict) and field.get('key')
         ]
 
-    def resolve_geography_filters(self, info):
-        return TicketConfig.geography_filters or {}
+    def resolve_location_filters(self, info):
+        return TicketConfig.location_filters or {}
 
     def resolve_search_filters(self, info):
         return TicketConfig.search_filters or []
