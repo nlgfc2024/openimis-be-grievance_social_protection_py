@@ -21,6 +21,17 @@ CATEGORY_SEPARATOR = ' > '
 VALID_ASSIGNMENT_STRATEGIES = frozenset({'random', 'round_robin', 'least_loaded'})
 VALID_ASSIGNMENT_SCOPES = frozenset({'district', 'national'})
 VALID_VIEW_SCOPE_DEFAULTS = frozenset({'all_cases', 'district_scoped', 'creator_scoped', 'none'})
+LOCATION_LEVELS = (
+    'district',
+    'ta',
+    'micro_catchment',
+    'hotspot',
+)
+LOCATION_LEVEL_PARENTS = {
+    'ta': 'district',
+    'micro_catchment': 'district',
+    'hotspot': 'micro_catchment',
+}
 ALLOWED_WORKFLOW_APPROVED_SIGNALS = frozenset({'payroll.benefit_consumption.create'})
 ALLOWED_WORKFLOW_RESOLVE_TASKS = frozenset({'tasks_management'})
 
@@ -67,6 +78,15 @@ DEFAULT_CFG = {
     },
     "notifications": {"on_assign": True, "include_due_date": True, "channels": ["email"]},
     "participant_fields": [],
+    # Intake reporter location chain
+    "location_filters": {
+        "enabled": False,
+        "levels": [
+            {"key": "district", "required": True},
+            {"key": "micro_catchment", "required": True},
+            {"key": "hotspot", "required": True},
+        ],
+    },
     "search_filters": ["formNumber", "location", "nationalId", "status", "priority", "dateRange"],
     "search_result_columns": [
         {"key": "code", "label": "Ticket Code"},
@@ -110,6 +130,7 @@ class TicketConfig(AppConfig):
     sla = {}
     notifications = {}
     participant_fields = []
+    location_filters = {}
     search_filters = []
     search_result_columns = []
     enable_export = False
@@ -192,6 +213,7 @@ class TicketConfig(AppConfig):
         self.__validate_attending_staff_roles(cfg)
         self.__validate_view_scope(cfg)
         self.__validate_category_workflows(cfg)
+        self.__validate_location_filters(cfg)
 
     def _merge_with_defaults(self, instance):
         return {**copy.deepcopy(DEFAULT_CFG), **instance._cfg}
@@ -422,6 +444,77 @@ class TicketConfig(AppConfig):
                 f"view_scope['default'] '{default}' is invalid. "
                 f"Allowed: {sorted(VALID_VIEW_SCOPE_DEFAULTS)}."
             )
+
+    @classmethod
+    def __validate_location_filters(cls, cfg):
+        location_filters = cfg.get('location_filters')
+        if not isinstance(location_filters, dict):
+            raise ValidationError("'location_filters' must be a dict.")
+
+        enabled = location_filters.get('enabled')
+        if not isinstance(enabled, bool):
+            raise ValidationError("location_filters['enabled'] must be a boolean.")
+
+        levels = location_filters.get('levels')
+        if enabled and (not isinstance(levels, list) or not levels):
+            raise ValidationError(
+                "location_filters['levels'] must be a nonempty list when enabled."
+            )
+        if levels is None:
+            return
+        if not isinstance(levels, list):
+            raise ValidationError("location_filters['levels'] must be a list.")
+
+        configured = {}
+        previous_position = -1
+        for level in levels:
+            if not isinstance(level, dict):
+                raise ValidationError("Each location_filters level must be a dict.")
+
+            level_key = level.get('key')
+            if level_key not in LOCATION_LEVELS:
+                raise ValidationError(
+                    f"Unsupported location level '{level_key}'. "
+                    f"Allowed: {list(LOCATION_LEVELS)}."
+                )
+            if level_key in configured:
+                raise ValidationError(f"Duplicate location level '{level_key}'.")
+            if not configured and level_key != 'district':
+                raise ValidationError(
+                    "location_filters levels must start with 'district'."
+                )
+
+            position = LOCATION_LEVELS.index(level_key)
+            if position <= previous_position:
+                raise ValidationError(
+                    "location_filters levels must follow "
+                    f"{', '.join(LOCATION_LEVELS)} order."
+                )
+
+            required = level.get('required')
+            if not isinstance(required, bool):
+                raise ValidationError(
+                    f"location_filters level '{level_key}' required must be a boolean."
+                )
+
+            parent = LOCATION_LEVEL_PARENTS.get(level_key)
+            if parent not in configured and parent is not None:
+                raise ValidationError(
+                    f"Location level '{level_key}' requires parent level '{parent}'."
+                )
+            if parent is not None and required and not configured[parent]:
+                raise ValidationError(
+                    f"Required location level '{level_key}' requires parent "
+                    f"level '{parent}' to be required."
+                )
+            if level_key in ('micro_catchment', 'hotspot') and 'ta' in configured:
+                raise ValidationError(
+                    "Location level 'ta' cannot be combined with "
+                    "'micro_catchment' or 'hotspot'."
+                )
+
+            configured[level_key] = required
+            previous_position = position
 
     @classmethod
     def __validate_category_workflows(cls, cfg):
