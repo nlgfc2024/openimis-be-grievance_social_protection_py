@@ -582,12 +582,6 @@ class TicketDerivedProjectFieldsTest(TestCase):
             code='BE07GRP', name='PWP Phase 3', type=BenefitPlan.BenefitPlanType.GROUP_TYPE)
         cls.group_plan.save(user=cls.user)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.group_plan.delete()
-        cls.benefit_plan.delete()
-        super().tearDownClass()
-
     def _enrolled_household_member(self, *, with_time_entries=None, with_hotspot=False):
         """
         Build an Individual who is a member of a household (Group) enrolled, via
@@ -800,12 +794,6 @@ class TicketReporterEnrolmentContextTest(TestCase):
         cls.individual_plan.save(user=cls.user)
         cls.activity = Activity(name='Enrolment Activity')
         cls.activity.save(user=cls.user)
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.individual_plan.delete()
-        cls.group_plan.delete()
-        super().tearDownClass()
 
     def _project(self, name, *, hotspot_name=None):
         tag = uuid.uuid4().hex[:6]
