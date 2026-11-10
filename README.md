@@ -30,6 +30,49 @@ Value - time to resolution in form of CRON timedelta: `{days},{hours}` where day
 (default: `{Default: '5,0'}`)
 Note: If for given type of the grievance time is not provided then default value is used from `resolution_times`.
 
+### Location Filtering
+
+Location filtering for grievance intake is disabled by default. Configure it with
+`location_filters`, using only `enabled` and `levels`. The Grievance Frontend
+reads this configuration through the `locationFilters` GraphQL field.
+
+For PWP, use:
+
+```json
+"location_filters": {
+  "enabled": true,
+  "levels": [
+    {"key": "district", "required": true},
+    {"key": "micro_catchment", "required": true},
+    {"key": "hotspot", "required": true}
+  ]
+}
+```
+
+For Jobs Now, use:
+
+```json
+"location_filters": {
+  "enabled": true,
+  "levels": [
+    {"key": "district", "required": true},
+    {"key": "ta", "required": true}
+  ]
+}
+```
+
+The `hotspots` GraphQL query requires permission `121925`. When `hotspot` is
+required, grievance intake officers must have this permission. Without it, they
+cannot load Hotspot options, Project selection remains locked, and grievance
+registration cannot be completed. Assign permission `121925` to the relevant
+intake roles through normal role management.
+
+If Hotspot selection is optional, setting `"required": false` for the `hotspot`
+level is a workaround that allows Project selection without a Hotspot.
+
+Grievance Backend PR #10 must be merged before the corresponding Grievance
+Frontend PR #10.
+
 ### Category Separator
 
 The system uses ` > ` (space-greater than-space) as the hierarchy separator in category full names. For example, a child category `Missing Documents` under parent `Enrollment` has the full name `Enrollment > Missing Documents`. This separator is used universally across the backend (internal keys, database storage, permission names) and frontend (display, Cascader values).

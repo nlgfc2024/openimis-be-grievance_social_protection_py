@@ -1,9 +1,11 @@
 import copy
 import json
+from types import SimpleNamespace
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
+import grievance_social_protection
 from core.models import ModuleConfiguration
 from grievance_social_protection.apps import TicketConfig, DEFAULT_CFG
 
@@ -35,6 +37,168 @@ class ConfigProcessingTest(TestCase):
         self.assertEqual(processed['complaint']['priority'], 'Medium')
         self.assertEqual(processed['complaint']['permissions'], [])
         self.assertEqual(processed['complaint']['parent'], None)
+
+    @staticmethod
+    def _validate_location_filters(levels=None, enabled=True):
+        location_filters = {'enabled': enabled}
+        if levels is not None:
+            location_filters['levels'] = levels
+        TicketConfig._TicketConfig__validate_location_filters({
+            'location_filters': location_filters,
+        })
+
+    def test_location_filters_accept_pwp_configuration(self):
+        self._validate_location_filters([
+            {'key': 'district', 'required': True},
+            {'key': 'micro_catchment', 'required': True},
+            {'key': 'hotspot', 'required': True},
+        ])
+
+    def test_location_filters_default_to_disabled_pwp_configuration(self):
+        self.assertEqual(DEFAULT_CFG['location_filters'], {
+            'enabled': False,
+            'levels': [
+                {'key': 'district', 'required': True},
+                {'key': 'micro_catchment', 'required': True},
+                {'key': 'hotspot', 'required': True},
+            ],
+        })
+
+    def test_location_filters_accept_jobs_now_configuration(self):
+        self._validate_location_filters([
+            {'key': 'district', 'required': True},
+            {'key': 'ta', 'required': True},
+        ])
+
+    def test_location_filters_accept_all_supported_chains(self):
+        chains = (
+            ('district',),
+            ('district', 'ta'),
+            ('district', 'micro_catchment'),
+            ('district', 'micro_catchment', 'hotspot'),
+        )
+        for chain in chains:
+            with self.subTest(chain=chain):
+                self._validate_location_filters([
+                    {'key': key, 'required': True} for key in chain
+                ])
+
+    def test_location_filters_reject_unsupported_level(self):
+        with self.assertRaisesRegex(ValidationError, "Unsupported location level 'region'"):
+            self._validate_location_filters([
+                {'key': 'district', 'required': True},
+                {'key': 'region', 'required': True},
+            ])
+
+    def test_location_filters_reject_duplicate_level(self):
+        with self.assertRaisesRegex(ValidationError, "Duplicate location level 'district'"):
+            self._validate_location_filters([
+                {'key': 'district', 'required': True},
+                {'key': 'district', 'required': True},
+            ])
+
+    def test_location_filters_reject_incorrect_order(self):
+        with self.assertRaisesRegex(ValidationError, 'must follow'):
+            self._validate_location_filters([
+                {'key': 'district', 'required': True},
+                {'key': 'micro_catchment', 'required': True},
+                {'key': 'ta', 'required': True},
+            ])
+
+    def test_location_filters_reject_missing_district(self):
+        with self.assertRaises(ValidationError):
+            self._validate_location_filters([
+                {'key': 'ta', 'required': True},
+            ])
+
+    def test_location_filters_reject_missing_parent(self):
+        with self.assertRaisesRegex(ValidationError, "requires parent level 'micro_catchment'"):
+            self._validate_location_filters([
+                {'key': 'district', 'required': True},
+                {'key': 'hotspot', 'required': True},
+            ])
+
+    def test_location_filters_reject_required_child_with_optional_parent(self):
+        with self.assertRaisesRegex(ValidationError, "parent level 'district' to be required"):
+            self._validate_location_filters([
+                {'key': 'district', 'required': False},
+                {'key': 'ta', 'required': True},
+            ])
+
+    def test_location_filters_reject_ta_with_pwp_levels(self):
+        with self.assertRaisesRegex(ValidationError, "cannot be combined"):
+            self._validate_location_filters([
+                {'key': 'district', 'required': True},
+                {'key': 'ta', 'required': True},
+                {'key': 'micro_catchment', 'required': True},
+            ])
+
+    def test_location_filters_reject_non_dict_level(self):
+        with self.assertRaisesRegex(ValidationError, 'must be a dict'):
+            self._validate_location_filters(['district'])
+
+    def test_location_filters_reject_missing_or_nonboolean_required(self):
+        invalid_levels = (
+            [{'key': 'district'}],
+            [{'key': 'district', 'required': 'yes'}],
+        )
+        for levels in invalid_levels:
+            with self.subTest(levels=levels), self.assertRaisesRegex(
+                ValidationError, 'required must be a boolean'
+            ):
+                self._validate_location_filters(levels)
+
+    def test_location_filters_require_nonempty_levels_when_enabled(self):
+        for levels in (None, []):
+            with self.subTest(levels=levels), self.assertRaisesRegex(
+                ValidationError, 'must be a nonempty list when enabled'
+            ):
+                self._validate_location_filters(levels)
+
+    def test_location_filters_allow_missing_levels_when_disabled(self):
+        self._validate_location_filters(enabled=False)
+
+    def test_location_filters_reject_nonboolean_enabled(self):
+        invalid_configs = (
+            {},
+            {'location_filters': None},
+            {'location_filters': []},
+            {'location_filters': {}},
+            {'location_filters': {'enabled': 1}},
+        )
+        for cfg in invalid_configs:
+            with self.subTest(cfg=cfg), self.assertRaises(ValidationError):
+                TicketConfig._TicketConfig__validate_location_filters(cfg)
+
+    def test_location_filters_partial_override_does_not_inherit_default_levels(self):
+        app_config = TicketConfig(
+            'grievance_social_protection', grievance_social_protection
+        )
+        override = SimpleNamespace(_cfg={'location_filters': {'enabled': True}})
+
+        merged = app_config._merge_with_defaults(override)
+        self.assertEqual(merged['location_filters'], {'enabled': True})
+        with self.assertRaisesRegex(
+            ValidationError, 'must be a nonempty list when enabled'
+        ):
+            app_config._validate_module_config(override)
+
+    def test_location_filters_partial_override_requires_enabled(self):
+        app_config = TicketConfig(
+            'grievance_social_protection', grievance_social_protection
+        )
+        override = SimpleNamespace(_cfg={
+            'location_filters': {
+                'levels': [{'key': 'district', 'required': True}],
+            },
+        })
+
+        merged = app_config._merge_with_defaults(override)
+        self.assertNotIn('enabled', merged['location_filters'])
+        with self.assertRaisesRegex(
+            ValidationError, 'enabled.*must be a boolean'
+        ):
+            app_config._validate_module_config(override)
 
     def test_process_mixed_categories(self):
         """Test processing mixed string and dict categories"""
