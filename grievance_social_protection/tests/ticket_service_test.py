@@ -17,6 +17,7 @@ from project_social_protection.models import (
     Activity, Project, BeneficiaryProjectEnrollment, BeneficiaryProjectTimeEntry,
     GroupBeneficiaryProjectEnrollment, GroupBeneficiaryProjectTimeEntry,
 )
+from payroll.models import BenefitConsumption, BenefitConsumptionStatus
 
 from grievance_social_protection.models import Ticket
 from grievance_social_protection.services import TicketService, AssignmentService
@@ -766,6 +767,39 @@ class TicketDerivedProjectFieldsTest(TestCase):
         self.assertEqual(preview.get('project_name'), 'PWP Phase 3')
         self.assertEqual(preview.get('days_worked'), 2)
         self.assertEqual(preview.get('hotspot_name'), 'PWP Hotspot')
+
+    def test_reconciled_payment_yields_yes_in_preview_and_ticket(self):
+        individual = create_test_individual(self.user)
+        BenefitConsumption(
+            individual=individual,
+            code=f'BE07-PAID-{individual.id.hex[:8]}',
+            status=BenefitConsumptionStatus.RECONCILED,
+        ).save(user=self.user)
+
+        preview = self.service.preview_reporter_derived_fields('individual', str(individual.id))
+        self.assertEqual(preview.get('paid'), 'YES')
+
+        result = self.service.create({
+            'category': 'Default',
+            'title': 'Paid reporter',
+            'channel': 'Channel A',
+            'reporter_type': 'individual',
+            'reporter_id': str(individual.id),
+        })
+        self.assertTrue(result.get('success', False), result.get('detail', 'No details provided'))
+        ticket = Ticket.objects.get(uuid=result['data']['uuid'])
+        self.assertEqual(ticket.json_ext.get('paid'), 'YES')
+
+    def test_unreconciled_payment_yields_no(self):
+        individual = create_test_individual(self.user)
+        BenefitConsumption(
+            individual=individual,
+            code=f'BE07-UNPAID-{individual.id.hex[:8]}',
+            status=BenefitConsumptionStatus.ACCEPTED,
+        ).save(user=self.user)
+
+        preview = self.service.preview_reporter_derived_fields('individual', str(individual.id))
+        self.assertEqual(preview.get('paid'), 'NO')
 
     def test_preview_reporter_derived_fields_unknown_reporter_returns_empty(self):
         self.assertEqual(self.service.preview_reporter_derived_fields('individual', '0' * 32), {})
