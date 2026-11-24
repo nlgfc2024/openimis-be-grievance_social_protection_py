@@ -8,6 +8,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied, ObjectDoesNotExist
 from django.core.mail import send_mail, BadHeaderError
 from django.db import transaction
+from django.db.models import F
 from django.template import loader
 
 from core.code_generation import generate_unique_year_code
@@ -814,7 +815,9 @@ class TicketService(BaseService):
 
         A reconciled benefit is a confirmed payment. Group benefits are paid to
         the household's PRIMARY recipient, so a grievance by any household
-        member uses that recipient's payment status.
+        member uses that recipient's payment status. The status is scoped to
+        the selected programme's payrolls and uses the latest benefit there;
+        payment in an unrelated programme must not show as paid.
         """
         reporter_type = obj_data.get('reporter_type')
         reporter_id = obj_data.get('reporter_id')
@@ -846,13 +849,27 @@ class TicketService(BaseService):
             recipient_ids = list(primary_recipient_ids) or recipient_ids
 
         try:
-            benefit_model = apps.get_model('payroll', 'BenefitConsumption')
-            paid = benefit_model.objects.filter(
-                individual_id__in=recipient_ids,
-                is_deleted=False,
-                status='RECONCILED',
-            ).exists()
-        except LookupError:
+            from payroll.models import BenefitConsumptionStatus
+
+            payroll_benefit_model = apps.get_model('payroll', 'PayrollBenefitConsumption')
+            benefit_plan_id = getattr(holder, 'benefit_plan_id', None)
+            latest_benefit_link = None
+            if benefit_plan_id:
+                latest_benefit_link = payroll_benefit_model.objects.filter(
+                    is_deleted=False,
+                    benefit__individual_id__in=recipient_ids,
+                    benefit__is_deleted=False,
+                    payroll__is_deleted=False,
+                    payroll__payment_plan__benefit_plan_id=str(benefit_plan_id),
+                ).select_related('benefit').order_by(
+                    F('benefit__date_due').desc(nulls_last=True),
+                    '-benefit__date_created',
+                ).first()
+            paid = bool(
+                latest_benefit_link
+                and latest_benefit_link.benefit.status == BenefitConsumptionStatus.RECONCILED
+            )
+        except (ImportError, LookupError):
             # Payroll is optional in some deployments; do not block intake.
             paid = False
 

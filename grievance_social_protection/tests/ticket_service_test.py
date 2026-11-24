@@ -17,7 +17,11 @@ from project_social_protection.models import (
     Activity, Project, BeneficiaryProjectEnrollment, BeneficiaryProjectTimeEntry,
     GroupBeneficiaryProjectEnrollment, GroupBeneficiaryProjectTimeEntry,
 )
-from payroll.models import BenefitConsumption, BenefitConsumptionStatus
+from contribution_plan.models import PaymentPlan
+from payroll.models import (
+    BenefitConsumption, BenefitConsumptionStatus, Payroll,
+    PayrollBenefitConsumption, PayrollStatus,
+)
 
 from grievance_social_protection.models import Ticket
 from grievance_social_protection.services import TicketService, AssignmentService
@@ -626,6 +630,33 @@ class TicketDerivedProjectFieldsTest(TestCase):
 
         return individual, group_beneficiary, enrollment
 
+    def _create_programme_benefit(self, individual, benefit_plan, status, date_due):
+        """Create a benefit linked to a payroll for one benefit programme."""
+        suffix = uuid.uuid4().hex[:8]
+        payment_plan = PaymentPlan(
+            code=f'BE07PP{suffix}',
+            name=f'BE07 Payment Plan {suffix}',
+            benefit_plan=benefit_plan,
+            periodicity=1,
+            calculation=uuid.uuid4(),
+        )
+        payment_plan.save(username=self.user.username)
+        payroll = Payroll(
+            name=f'BE07 Payroll {suffix}',
+            payment_plan=payment_plan,
+            status=PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        payroll.save(username=self.user.username)
+        benefit = BenefitConsumption(
+            individual=individual,
+            code=f'BE07BEN{suffix}',
+            date_due=date_due,
+            status=status,
+        )
+        benefit.save(user=self.user)
+        PayrollBenefitConsumption(payroll=payroll, benefit=benefit).save(user=self.user)
+        return benefit
+
     def test_beneficiary_reporter_yields_project_name(self):
         individual = create_test_individual(self.user)
         beneficiary = Beneficiary(
@@ -770,11 +801,14 @@ class TicketDerivedProjectFieldsTest(TestCase):
 
     def test_reconciled_payment_yields_yes_in_preview_and_ticket(self):
         individual = create_test_individual(self.user)
-        BenefitConsumption(
-            individual=individual,
-            code=f'BE07-PAID-{individual.id.hex[:8]}',
-            status=BenefitConsumptionStatus.RECONCILED,
+        Beneficiary(
+            individual=individual, benefit_plan=self.benefit_plan,
+            status=BeneficiaryStatus.ACTIVE,
         ).save(user=self.user)
+        self._create_programme_benefit(
+            individual, self.benefit_plan,
+            BenefitConsumptionStatus.RECONCILED, date(2026, 1, 1),
+        )
 
         preview = self.service.preview_reporter_derived_fields('individual', str(individual.id))
         self.assertEqual(preview.get('paid'), 'YES')
@@ -792,14 +826,46 @@ class TicketDerivedProjectFieldsTest(TestCase):
 
     def test_unreconciled_payment_yields_no(self):
         individual = create_test_individual(self.user)
-        BenefitConsumption(
-            individual=individual,
-            code=f'BE07-UNPAID-{individual.id.hex[:8]}',
-            status=BenefitConsumptionStatus.ACCEPTED,
+        Beneficiary(
+            individual=individual, benefit_plan=self.benefit_plan,
+            status=BeneficiaryStatus.ACTIVE,
         ).save(user=self.user)
+        self._create_programme_benefit(
+            individual, self.benefit_plan,
+            BenefitConsumptionStatus.ACCEPTED, date(2026, 1, 1),
+        )
 
         preview = self.service.preview_reporter_derived_fields('individual', str(individual.id))
         self.assertEqual(preview.get('paid'), 'NO')
+
+    def test_paid_status_uses_latest_benefit_in_selected_programme(self):
+        individual = create_test_individual(self.user)
+        Beneficiary(
+            individual=individual, benefit_plan=self.benefit_plan,
+            status=BeneficiaryStatus.ACTIVE,
+        ).save(user=self.user)
+        # Payment in another programme must not make this programme show paid.
+        self._create_programme_benefit(
+            individual, self.group_plan,
+            BenefitConsumptionStatus.RECONCILED, date(2026, 3, 1),
+        )
+        self._create_programme_benefit(
+            individual, self.benefit_plan,
+            BenefitConsumptionStatus.ACCEPTED, date(2026, 2, 1),
+        )
+        self.assertEqual(
+            self.service.preview_reporter_derived_fields('individual', str(individual.id)).get('paid'),
+            'NO',
+        )
+
+        self._create_programme_benefit(
+            individual, self.benefit_plan,
+            BenefitConsumptionStatus.RECONCILED, date(2026, 4, 1),
+        )
+        self.assertEqual(
+            self.service.preview_reporter_derived_fields('individual', str(individual.id)).get('paid'),
+            'YES',
+        )
 
     def test_preview_reporter_derived_fields_unknown_reporter_returns_empty(self):
         self.assertEqual(self.service.preview_reporter_derived_fields('individual', '0' * 32), {})
