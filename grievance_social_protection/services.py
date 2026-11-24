@@ -8,6 +8,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError, PermissionDenied, ObjectDoesNotExist
 from django.core.mail import send_mail, BadHeaderError
 from django.db import transaction
+from django.db.models import F
 from django.template import loader
 
 from core.code_generation import generate_unique_year_code
@@ -447,6 +448,7 @@ class TicketService(BaseService):
         self._denormalize_reporter_fields(obj_data)
         self._apply_derived_district(obj_data)
         self._apply_derived_micro_catchment(obj_data)
+        self._apply_derived_paid(obj_data)
         self._apply_derived_project_fields(obj_data)
         self._apply_auto_assignment(obj_data)
         self._apply_status_transition(obj_data)
@@ -808,6 +810,73 @@ class TicketService(BaseService):
     # preview args); consumed and stripped here, never written to the model.
     REPORTER_ENROLMENT_CONTEXT_KEYS = ('reporter_project_id', 'reporter_group_beneficiary_id')
 
+    def _apply_derived_paid(self, obj_data):
+        """Save the reporter's payment status as an immutable ticket snapshot.
+
+        A reconciled benefit is a confirmed payment. Group benefits are paid to
+        the household's PRIMARY recipient, so a grievance by any household
+        member uses that recipient's payment status. The status is scoped to
+        the selected programme's payrolls and uses the latest benefit there;
+        payment in an unrelated programme must not show as paid.
+        """
+        reporter_type = obj_data.get('reporter_type')
+        reporter_id = obj_data.get('reporter_id')
+        if not reporter_type or not reporter_id:
+            return
+
+        individual = self._resolve_reporter_individual(reporter_type, reporter_id)
+        if not individual:
+            return
+
+        holder = None
+        try:
+            holder, _ = _resolve_reporter_enrolment(
+                reporter_type,
+                reporter_id,
+                project_id=obj_data.get('reporter_project_id'),
+                group_beneficiary_id=obj_data.get('reporter_group_beneficiary_id'),
+            )
+        except (ValueError, ValidationError, ObjectDoesNotExist):
+            # Intake context is optional; fall back to the reporter itself.
+            pass
+
+        recipient_ids = [individual.id]
+        if holder is not None and getattr(holder, 'group_id', None):
+            primary_recipient_ids = holder.group.groupindividuals.filter(
+                is_deleted=False,
+                recipient_type='PRIMARY',
+            ).values_list('individual_id', flat=True)
+            recipient_ids = list(primary_recipient_ids) or recipient_ids
+
+        try:
+            from payroll.models import BenefitConsumptionStatus
+
+            payroll_benefit_model = apps.get_model('payroll', 'PayrollBenefitConsumption')
+            benefit_plan_id = getattr(holder, 'benefit_plan_id', None)
+            latest_benefit_link = None
+            if benefit_plan_id:
+                latest_benefit_link = payroll_benefit_model.objects.filter(
+                    is_deleted=False,
+                    benefit__individual_id__in=recipient_ids,
+                    benefit__is_deleted=False,
+                    payroll__is_deleted=False,
+                    payroll__payment_plan__benefit_plan_id=str(benefit_plan_id),
+                ).select_related('benefit').order_by(
+                    F('benefit__date_due').desc(nulls_last=True),
+                    '-benefit__date_created',
+                ).first()
+            paid = bool(
+                latest_benefit_link
+                and latest_benefit_link.benefit.status == BenefitConsumptionStatus.RECONCILED
+            )
+        except (ImportError, LookupError):
+            # Payroll is optional in some deployments; do not block intake.
+            paid = False
+
+        json_ext = dict(obj_data.get('json_ext') or {})
+        json_ext['paid'] = 'YES' if paid else 'NO'
+        obj_data['json_ext'] = json_ext
+
     def _apply_derived_project_fields(self, obj_data):
         """
         Derive project_name, days_worked and hotspot_name from the exact project
@@ -873,6 +942,7 @@ class TicketService(BaseService):
             self._denormalize_reporter_fields(obj_data)
             self._apply_derived_district(obj_data)
             self._apply_derived_micro_catchment(obj_data)
+            self._apply_derived_paid(obj_data)
             self._apply_derived_project_fields(obj_data)
         except (LookupError, ObjectDoesNotExist, ValueError):
             # Unknown / malformed reporter — nothing to preview, not an error.
